@@ -15,7 +15,7 @@
 #SBATCH -o ./slurm/%j.out
 
 
-##echo interactive: srun --account=project_462000183 --partition=standard-g --time=4:00:00 --gpus-per-node 1 --cpus-per-task=4 --mem=0 --pty bash
+##echo interactive: srun --account=project_462000183 --partition=standard-g --time=4:00:00 --gpus-per-node 1 --cpus-per-task=4 --mem=32G --pty bash
 ##echo mkdir tykky_env my-python-env
 ##echo conda-containerize new --mamba --prefix tykky_env tykky_env_lumi.yml
 

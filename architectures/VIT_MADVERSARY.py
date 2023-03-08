@@ -96,25 +96,22 @@ class VIT_MADVERSARY(ViTMAEPreTrainedModel):
         """
         cfg.model = self.__class__.__name__
         cfg = Config.from_cfg(cfg)
-        cfg_ae = ViTMAEConfig(**cfg.mae.dict())
-        super().__init__(cfg_ae)
+        cfg_encoder = ViTMAEConfig(**cfg.mae.dict())
+        cfg_decoder = ViTMAEConfig(**cfg.mae.dict())
+        cfg_decoder.num_channels = 4
+        super().__init__(cfg_encoder)
 
 
-        cfg_mask = ViTMAEConfig(**cfg.mae.dict())
-        cfg_mask.num_channels = 1
+        # mask
+        self.embeddings = ViTMAEEmbeddings(cfg_encoder)
+        self.layernorm = nn.LayerNorm(cfg_encoder.hidden_size, eps=cfg_encoder.layer_norm_eps)
+        self.vit_encoder = ViTMAEEncoder(cfg_encoder)
+        self.decoder = ViTMAEDecoder(cfg_decoder, num_patches=self.embeddings.num_patches)
 
-        # encoder
-        self.embeddings = ViTMAEEmbeddings(cfg_ae)
-        self.layernorm = nn.LayerNorm(cfg_ae.hidden_size, eps=cfg_ae.layer_norm_eps)
-        self.vit_encoder = ViTMAEEncoder(cfg_ae)
 
-        # decoders
-        self.mask_decoder = ViTMAEDecoder(cfg_mask, num_patches=self.embeddings.num_patches)
-        self.rec_decoder = ViTMAEDecoder(cfg_ae, num_patches=self.embeddings.num_patches)
+        params = list(list(self.embeddings.parameters()) + list(self.layernorm.parameters()) + list(self.vit_encoder.parameters()) + list(self.decoder.parameters()))
 
-        encoder_params = list(self.embeddings.parameters()) + list(self.layernorm.parameters()) + list(self.vit_encoder.parameters())
-        self.optimizer_rec = torch.optim.Adam(encoder_params + list(self.rec_decoder.parameters()), lr=cfg.lr)
-        self.optimizer_mask = torch.optim.Adam(encoder_params + list(self.mask_decoder.parameters()), lr=cfg.lr)
+        self.optimizer = torch.optim.Adam(params, lr=cfg.lr)
         self.to(device)
         self.cfg = cfg
 
@@ -199,19 +196,19 @@ class VIT_MADVERSARY(ViTMAEPreTrainedModel):
         loss = (pred - target) ** 2
         loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
 
-        #loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
+        loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
         return loss.mean() # loss on reconstruction
 
 
 
     def forward(self, image, mask_ratio=0.75, output_attentions = False):
         B = image.shape[0]
-        patches_num = self.embeddings.num_patches
+        num_patches = self.embeddings.num_patches
 
         ### MASKING
         # encoder for mask
         head_mask = self.get_head_mask(None, self.config.num_hidden_layers)
-        embedding_output, mask, ids_restore = self.embeddings(image, mask_ratio = 0)
+        embedding_output, mask_random, ids_restore = self.embeddings(image, mask_ratio = mask_ratio)
 
         encoder_outputs = self.vit_encoder(
             embedding_output,
@@ -223,16 +220,22 @@ class VIT_MADVERSARY(ViTMAEPreTrainedModel):
         sequence_output = self.layernorm(sequence_output)
 
         # decoder for mask
-        decoder_outputs = self.mask_decoder(sequence_output, ids_restore)
-        logits_mask = decoder_outputs.logits  # shape (batch_size, num_patches, patch_size*patch_size*num_channels)
-        mask_prob = torch.sigmoid(logits_mask)
-        patch_mask_probs = utils.normalize(mask_prob.sum(dim=2).to(self.device))
+        decoder_outputs = self.decoder(sequence_output, ids_restore)
+        logits = decoder_outputs.logits.reshape(B, num_patches, self.cfg.mae.patch_size, self.cfg.mae.patch_size, 4)  # shape (batch_size, num_patches, patch_size, patch_size) - mask
+
+        logits_random_img = logits[:,:,:,:, :3].reshape(B, num_patches, -1)
+
+        recon_mask = logits[:,:,:,:, -1]
+        mask_prob = torch.sigmoid(recon_mask)
+        patch_mask_probs = utils.normalize(mask_prob.reshape(B, num_patches,-1).sum(dim=2).to(self.device))
+        loss_random_recon = self.forward_loss(image, logits_random_img, mask_random) # we want it to be good
+
 
 
         ### RECONSTRUCTION
         # encoder for reconstruction
         head_mask = self.get_head_mask(None, self.config.num_hidden_layers)
-        embedding_output, mask, ids_restore = self.embeddings(image, mask_ratio= mask_ratio, noise = patch_mask_probs)
+        embedding_output, mask_learned, ids_restore = self.embeddings(image, mask_ratio= mask_ratio, noise = patch_mask_probs)
 
         encoder_outputs = self.vit_encoder(
             embedding_output,
@@ -244,12 +247,20 @@ class VIT_MADVERSARY(ViTMAEPreTrainedModel):
         sequence_output = self.layernorm(sequence_output)
 
         # decoder for reconstruction
-        decoder_outputs = self.rec_decoder(sequence_output, ids_restore)
-        logits_img = decoder_outputs.logits  # shape (batch_size, num_patches, patch_size*patch_size*num_channels)
+        decoder_outputs = self.decoder(sequence_output, ids_restore)
+        logits = decoder_outputs.logits.reshape(B, num_patches, self.cfg.mae.patch_size, self.cfg.mae.patch_size, 4)  # shape (batch_size, num_patches, patch_size, patch_size) - mask
+        logits_masked_img = logits[:,:,:,:, :3].reshape(B, num_patches, -1) # we want it to be bad
 
+        loss_masked_recon = -self.forward_loss(image, logits_masked_img, mask_learned) # we want it to be bad
 
-        loss_recon = self.forward_loss(image, logits_img, mask)
-        return loss_recon, logits_img, mask, ids_restore, None
+        return {
+                "loss_random_recon": loss_random_recon,
+                "logits_random_img": logits_random_img,
+                "mask_random": mask_random,
+
+                "loss_masked_recon": loss_masked_recon,
+                "logits_masked_img": logits_masked_img,
+                "mask_learned": mask_learned}
 
 
 
@@ -262,43 +273,46 @@ class VIT_MADVERSARY(ViTMAEPreTrainedModel):
             learning_rate = self.cfg.lr * (iteration / self.cfg.warmup_steps)
         else:
             learning_rate = self.cfg.lr
-        mask_ratio = 0.3 # max(iteration / total_iter, 0.2)
+        mask_ratio =  0.5 #min(1-(iteration / total_iter), 0.5)
 
         learning_rate = learning_rate * (self.cfg.decay_rate ** (
                 iteration / self.cfg.decay_steps))
 
-        self.optimizer_rec.param_groups[0]['lr'] = learning_rate
-        self.optimizer_mask.param_groups[0]['lr'] = learning_rate
+        self.optimizer.param_groups[0]['lr'] = learning_rate
         log_dict["lr"] = learning_rate
 
         image = sample['image'].permute(0, 3, 1, 2).to(self.device) / 255.  # B, C, W, H
 
 
 
-        loss, logits, mask, ids_restore, attentions = self.forward(image, mask_ratio = mask_ratio, output_attentions = True)
+        res = self.forward(image, mask_ratio = mask_ratio, output_attentions = True)
+        recons_random = self.reconstruct_image_from_logits(res["logits_random_img"]) # B, H, W, C
+        recons_masked = self.reconstruct_image_from_logits(res["logits_masked_img"]) # B, H, W, C
 
-        recons = self.reconstruct_image_from_logits(logits) # B, H, W, C
+        loss_random_recon = res["loss_random_recon"]
+        loss_masked_recon = res["loss_masked_recon"]
+
+        #scale = 1/loss_masked_recon.item()*loss_random_recon.item()
+        #log_dict["scale"] = scale
+
+        loss = loss_random_recon + torch.clip(loss_masked_recon, -0.05, 0.05)
+
         image = image.permute(0, 2, 3, 1)
-
         log_dict["mask_ratio"] = mask_ratio
         log_dict["loss"] = loss.item()
+        log_dict["loss_random_recon"] = res["loss_random_recon"].item()
+        log_dict["loss_masked_recon"] = res["loss_masked_recon"].item()
         if visualize:
-            log_dict["images"] = self.visualize(image, recons, attentions, mask)
+            log_dict["images"] = self.visualize(image, recons_random, recons_masked, res["mask_random"], res["mask_learned"])
 
-        loss_mask = -loss
-        self.optimizer_mask.zero_grad()
-        loss_mask.backward(retain_graph=True)
-        self.optimizer_mask.step()
-
-
-        self.optimizer_rec.zero_grad()
+        self.optimizer.zero_grad()
         loss.backward()
-        self.optimizer_rec.step()
+        self.optimizer.step()
 
         return log_dict
 
 
-    def visualize(self, image, recons, attentions, mask, max_rows=6):
+    def visualize(self, image, recons_random, recons_masked, mask_random, mask_learned, max_rows=6):
         """Visualizes the training progress."""
         """
         Args:
@@ -311,11 +325,13 @@ class VIT_MADVERSARY(ViTMAEPreTrainedModel):
 
         batch_size = min(image.shape[0], max_rows)
         image = image[:batch_size]
-        recons = recons[:batch_size]
-        mask = mask[:batch_size]
-        # todo: cut attention
+        recons_random = recons_random[:batch_size]
+        recons_masked= recons_masked[:batch_size]
+        mask_random = mask_random[:batch_size]
+        mask_learned = mask_learned[:batch_size]
 
-        titles = ["image", "mask"] + ["masked"] + ["recon"] # + [f"attention {i + 1}" for i in range(self.cfg.mae.decoder_num_hidden_layers + self.cfg.mae.num_hidden_layers)]
+
+        titles = ["image", "mask random", "masked input", "recon random", "mask learned", "masked input", "recon masked"]
         fig, ax = plt.subplots(batch_size, len(titles), figsize=(20, 9))
 
         patch_size = self.cfg.mae.patch_size
@@ -323,10 +339,13 @@ class VIT_MADVERSARY(ViTMAEPreTrainedModel):
         patches_num = img_size//patch_size
 
         image = normalize(image.cpu().detach().numpy())  # B, H, W, C
-        recons = normalize(recons.cpu().detach().numpy())  # B, H, W, C
+        recons_random = normalize(recons_random.cpu().detach().numpy())  # B, H, W, C
+        recons_masked = normalize(recons_masked.cpu().detach().numpy())  # B, H, W, C
 
-        mask = F.interpolate(mask.detach().cpu().expand(3,-1,-1).reshape(-1, batch_size, patches_num, patches_num).permute(1,0,2,3), (img_size,img_size)).permute(0,2,3,1)  # B, H, W, C
-        masked_input = (1-mask) * image
+        mask_random = F.interpolate(mask_random.detach().cpu().expand(3,-1,-1).reshape(-1, batch_size, patches_num, patches_num).permute(1,0,2,3), (img_size,img_size)).permute(0,2,3,1)  # B, H, W, C
+        masked_input_random = (1-mask_random) * image
+        mask_learned = F.interpolate(mask_learned.detach().cpu().expand(3,-1,-1).reshape(-1, batch_size, patches_num, patches_num).permute(1,0,2,3), (img_size,img_size)).permute(0,2,3,1)  # B, H, W, C
+        masked_input_learned = (1-mask_learned) * image
 
         for i, title in enumerate(titles):
             ax[0, i].set_title(title)
@@ -336,17 +355,31 @@ class VIT_MADVERSARY(ViTMAEPreTrainedModel):
             ax[batch_id, 0].grid(False)
             ax[batch_id, 0].axis('off')
 
-            ax[batch_id, 1].imshow(mask[batch_id])
+            # random
+            ax[batch_id, 1].imshow(mask_random[batch_id])
             ax[batch_id, 1].grid(False)
             ax[batch_id, 1].axis('off')
 
-            ax[batch_id, 2].imshow(masked_input[batch_id])
+            ax[batch_id, 2].imshow(masked_input_random[batch_id])
             ax[batch_id, 2].grid(False)
             ax[batch_id, 2].axis('off')
 
-            ax[batch_id, 3].imshow(recons[batch_id])
+            ax[batch_id, 3].imshow(masked_input_random[batch_id] + mask_random[batch_id] * recons_random[batch_id])
             ax[batch_id, 3].grid(False)
             ax[batch_id, 3].axis('off')
+
+            # learned mask
+            ax[batch_id, 4].imshow(mask_learned[batch_id])
+            ax[batch_id, 4].grid(False)
+            ax[batch_id, 4].axis('off')
+
+            ax[batch_id, 5].imshow(masked_input_learned[batch_id])
+            ax[batch_id, 5].grid(False)
+            ax[batch_id, 5].axis('off')
+
+            ax[batch_id, 6].imshow(masked_input_learned[batch_id] + mask_learned[batch_id]*recons_masked[batch_id])
+            ax[batch_id, 6].grid(False)
+            ax[batch_id, 6].axis('off')
 
             #for i in range(num_slots):
             #    ax[batch_id, i + 2].imshow(picture[batch_id, i])
