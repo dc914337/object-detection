@@ -37,7 +37,7 @@ class TetrominoesDataset(data.Dataset):
         # get data
         x = self.dataset["imgs"][index]
         if self.transform:
-            x = self.transform(x)
+            x = self.transform(x.permute(2,0,1)).permute(1,2,0)
 
         # get label
         y = self.dataset["masks"][index]

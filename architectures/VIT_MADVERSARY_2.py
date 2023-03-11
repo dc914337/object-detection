@@ -252,12 +252,12 @@ class VIT_MADVERSARY_2(ViTMAEPreTrainedModel):
         parser.add_argument('--warmup_steps', default=1000, type=int,
                             help='Number of warmup steps for the learning rate.')
         parser.add_argument('--decay_rate', default=0.5, type=float, help='Rate for the learning rate decay.')
-        parser.add_argument('--decay_steps', default=20000, type=int,
+        parser.add_argument('--decay_steps', default=50000, type=int,
                             help='Number of steps for the learning rate decay.')
 
         ## MAE parameters
-        parser.add_argument('--resolution', dest = "mae.image_size", type=int, default=35)
-        parser.add_argument('--patch_size', dest = "mae.patch_size", type=int, default=5)
+        parser.add_argument('--resolution', dest = "mae.image_size", type=int, default=36)
+        parser.add_argument('--patch_size', dest = "mae.patch_size", type=int, default=3)
 
         # encoder
         parser.add_argument('--enc_num_layers',dest = "mae.num_hidden_layers", type=int, default=5)
@@ -275,8 +275,8 @@ class VIT_MADVERSARY_2(ViTMAEPreTrainedModel):
         parser.add_argument('--mask_ratio', dest = "mae.mask_ratio", type=float, default=0.75)
 
         # load params
-        parser.add_argument('--recon_path', dest="recon_path", type=str, default="./checkpoints/recon_madversary_2_best_random.pt")
-        parser.add_argument('--masker_path', dest="masker_path", type=str, default="./checkpoints/recon_madversary_2_best_random.pt")
+        parser.add_argument('--recon_path', dest="recon_path", type=str, default=None)#"./checkpoints/recon_madversary_2_best_random.pt")
+        parser.add_argument('--masker_path', dest="masker_path", type=str, default=None)#"./checkpoints/recon_madversary_2_best_random.pt")
 
         return parser
 
@@ -438,14 +438,19 @@ class VIT_MADVERSARY_2(ViTMAEPreTrainedModel):
 
 
 
-    def forward(self, image, mask_ratio=0.75, temperature=1, output_attentions = False):
+    def forward(self, image, mask_ratio=0.75, temperature=1., train_recon = False):
 
-        mask_prob, mask_logits = self.masker(image, mask_ratio=mask_ratio, temperature=temperature)
+        if train_recon:
+            image_logits, mask_learned = self.reconstructor(image, mask_ratio=mask_ratio, mask_noise=None)
+            loss_masked_recon = self.forward_loss(image, image_logits, mask_learned)
+            mask_prob = mask_learned
+            mask_logits = mask_prob
 
-        image_logits, mask_learned = self.reconstructor(image, mask_ratio=mask_ratio, mask_noise = mask_prob)
+        else:
+            mask_prob, mask_logits = self.masker(image, mask_ratio=mask_ratio, temperature=temperature)
+            image_logits, mask_learned = self.reconstructor(image, mask_ratio=mask_ratio, mask_noise = mask_prob)
+            loss_masked_recon = self.forward_loss(image, image_logits, mask_prob)
 
-
-        loss_masked_recon = self.forward_loss(image, image_logits, mask_prob)
 
         patch_means = mask_prob.mean(dim=1)
         loss_mask = ((patch_means - mask_ratio)**2).mean()
@@ -474,12 +479,12 @@ class VIT_MADVERSARY_2(ViTMAEPreTrainedModel):
             learning_rate = self.cfg.lr * (iteration / self.cfg.warmup_steps)
         else:
             learning_rate = self.cfg.lr
-        #mask_ratio = min((iteration / 50000)+0.05, 0.75)
-        #mask_ratio = max(1-(iteration / 5000)-0.1, 0.4)
+        #mask_ratio = min((iteration / 15000)+0.15, 0.75)
+        #mask_ratio = max(1-(iteration / 15000)-0.1, 0.18)
         #mask_ratio = random.uniform(0.15, 0.85)
-        mask_ratio = 0.2 # one object
+        mask_ratio = 0.3 # one object
         #temperature = max(0.1-(iteration/10000*0.1), 0.0001)
-        temperature = 0.025 #max(0.1-(iteration/10000*0.1), 0.0001)
+        temperature = 0.7 #max(0.1-(iteration/10000*0.1), 0.0001)
 
         learning_rate = learning_rate * (self.cfg.decay_rate ** (
                 iteration / self.cfg.decay_steps))
@@ -492,7 +497,7 @@ class VIT_MADVERSARY_2(ViTMAEPreTrainedModel):
 
 
 
-        res = self.forward(image, mask_ratio = mask_ratio, output_attentions = True, temperature = temperature)
+        res = self.forward(image, mask_ratio = mask_ratio, temperature = temperature, train_recon = train_recon)
         recons_masked = self.reconstruct_image_from_logits(res["logits_masked_img"]) # B, H, W, C
 
         loss_masked_recon = res["loss_masked_recon"]

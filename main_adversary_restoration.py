@@ -2,6 +2,7 @@ from argparse import ArgumentParser
 import gc
 import torch
 from torch.utils.tensorboard import SummaryWriter
+from torchvision.transforms import Resize
 from tqdm import tqdm
 import utils
 from architectures.SlotAttention_AutoEncoder import SlotAttentionAutoEncoder
@@ -41,7 +42,7 @@ def main():
     print(f"Total parameters: {pytorch_total_params}")
 
     train_loader = torch.utils.data.DataLoader(
-        TetrominoesDataset(cfg.dataset_path, recursive = False, load_data = True),
+        TetrominoesDataset(cfg.dataset_path, recursive = False, load_data = True, transform=Resize((36, 36))),
         batch_size=cfg.batch_size,
         shuffle=True,
         num_workers=7,
