@@ -7,9 +7,7 @@ from tqdm import tqdm
 import utils
 from architectures.SlotAttention_AutoEncoder import SlotAttentionAutoEncoder
 import wandb
-from architectures.VIT_MADVERSARY import VIT_MADVERSARY
-from architectures.VIT_MADVERSARY_2 import VIT_MADVERSARY_2
-from architectures.VIT_MAE import VIT_MAE
+from architectures.VIT_MADVERSARY_2_slots import VIT_MADVERSARY_2_slots
 from dataloaders.h5_loader import TetrominoesDataset
 
 torch.multiprocessing.set_sharing_strategy('file_system')
@@ -17,7 +15,7 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 
 def main():
 
-    MODEL_CLASS = VIT_MADVERSARY_2
+    MODEL_CLASS = VIT_MADVERSARY_2_slots
 
     """ARGUMENTS"""
     parser = ArgumentParser()
@@ -53,7 +51,7 @@ def main():
     """TRAINING LOOP"""
     iteration = 0
     epoch = 1
-    total_iter = 200000
+    total_iter = 300000
     with torch.autograd.set_detect_anomaly(cfg.DEBUG) and tqdm(initial=iteration, total=total_iter,
                                                                disable=utils.is_slurm()) as pbar:
         while iteration < total_iter:

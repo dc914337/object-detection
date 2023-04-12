@@ -240,7 +240,7 @@ class Masker(Recon):
         return patch_mask_probs[:, :, :], patch_logits[:, :, :]
 
 
-class VIT_MADVERSARY_2(ViTMAEPreTrainedModel):
+class VIT_MADVERSARY_2_slots(ViTMAEPreTrainedModel):
     """Slot Attention-based auto-encoder for object discovery."""
 
     @classmethod
