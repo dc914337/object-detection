@@ -8,6 +8,7 @@ import utils
 from architectures.SlotAttention_AutoEncoder import SlotAttentionAutoEncoder
 import wandb
 from architectures.VIT_MADVERSARY_2_slots import VIT_MADVERSARY_2_slots
+from architectures.VIT_MADVERSARY_2 import VIT_MADVERSARY_2
 from dataloaders.h5_loader import TetrominoesDataset
 
 torch.multiprocessing.set_sharing_strategy('file_system')
@@ -15,7 +16,8 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 
 def main():
 
-    MODEL_CLASS = VIT_MADVERSARY_2_slots
+    MODEL_CLASS = VIT_MADVERSARY_2
+    #MODEL_CLASS = VIT_MADVERSARY_2_slots
 
     """ARGUMENTS"""
     parser = ArgumentParser()

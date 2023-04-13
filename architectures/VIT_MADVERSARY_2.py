@@ -164,7 +164,7 @@ class Recon(ViTMAEPreTrainedModel):
         self.layernorm_recon = nn.LayerNorm(self.cfg_vit.hidden_size, eps=self.cfg_vit.layer_norm_eps)
         self.vit_encoder_recon = ViTMAEEncoder(self.cfg_vit)
         self.decoder_recon = ViTMAEDecoder(self.cfg_vit, num_patches=self.embeddings_recon.num_patches)
-        self.params_recon = list(list(self.embeddings_recon.parameters()) +
+        self.params = list(list(self.embeddings_recon.parameters()) +
                             list(self.layernorm_recon.parameters()) +
                             list(self.vit_encoder_recon.parameters()) +
                             list(self.decoder_recon.parameters()))
@@ -202,14 +202,24 @@ class Recon(ViTMAEPreTrainedModel):
         print("unexpected keys: ", unexpected_keys)
 
 
-class Masker(Recon):
+class Masker(ViTMAEPreTrainedModel):
     def __init__(self, cfg):
         self.cfg = cfg
-        self.cfg_vit_masker = ViTMAEConfig(**cfg.mae.dict())
-        self.cfg_vit_masker.num_channels = 4
-        super(Masker, self).__init__(cfg)
-        self.mask_decoder = ViTMaskDecoder(self.cfg_vit_masker, num_patches=self.embeddings_recon.num_patches)
-        self.params_masker = self.mask_decoder.parameters()
+        self.cfg_vit = ViTMAEConfig(**cfg.mae.dict())
+        super(Masker, self).__init__(self.cfg_vit)
+        self.embeddings_recon = ViTMAEEmbeddings(self.cfg_vit)
+        self.layernorm_recon = nn.LayerNorm(self.cfg_vit.hidden_size, eps=self.cfg_vit.layer_norm_eps)
+        self.vit_encoder_recon = ViTMAEEncoder(self.cfg_vit)
+
+        self.cfg_vit_decoder = ViTMAEConfig(**cfg.mae.dict())
+        self.cfg_vit_decoder.num_channels = 4
+        self.decoder_mask = ViTMaskDecoder(self.cfg_vit_decoder, num_patches=self.embeddings_recon.num_patches)
+
+        self.params = list(list(self.embeddings_recon.parameters()) +
+                                 list(self.layernorm_recon.parameters()) +
+                                 list(self.vit_encoder_recon.parameters()) +
+                                 list(self.decoder_mask.parameters()))
+
 
     def forward(self, image, mask_ratio=0.75, temperature=1, output_attentions=False):
         B = image.shape[0]
@@ -217,9 +227,8 @@ class Masker(Recon):
         patch_size = self.cfg.mae.patch_size
 
         # encoder for mask
-        head_mask = self.get_head_mask(None, self.config.num_hidden_layers)
-        embedding_output, mask_random, ids_restore = self.embeddings_recon(image,
-                                                                            mask_ratio=0)  # inputting unmasked image
+        head_mask = self.get_head_mask(None, self.cfg_vit.num_hidden_layers)
+        embedding_output, mask_random, ids_restore = self.embeddings_recon(image, mask_ratio=0)  # inputting unmasked image
 
         encoder_outputs = self.vit_encoder_recon(
             embedding_output,
@@ -231,14 +240,21 @@ class Masker(Recon):
         sequence_output = self.layernorm_recon(sequence_output)
 
         # decoder for mask
-        decoder_outputs = self.mask_decoder(sequence_output,
-                                              ids_restore)  # shape (batch_size, num_patches, patch_size**2 * channels)
+        decoder_outputs = self.decoder_mask(sequence_output,
+                                            ids_restore)  # shape (batch_size, num_patches, patch_size**2 * channels)
         patch_logits = decoder_outputs.logits.reshape(B, num_patches,
                                                       4)  # shape (batch_size, num_patches, patch_size^2, 2)
         patch_mask_probs = F.gumbel_softmax(patch_logits, tau=temperature, hard=True,
                                             dim=-1)  # shape (batch_size, num_patches, patch_size, patch_size)
         return patch_mask_probs[:, :, :], patch_logits[:, :, :]
 
+    def save(self, path):
+        torch.save(self.state_dict(), path)
+
+    def load(self, path):
+        missing_keys, unexpected_keys = self.load_state_dict(torch.load(path), strict=False)
+        print("missing keys: ", missing_keys)
+        print("unexpected keys: ", unexpected_keys)
 
 class VIT_MADVERSARY_2(ViTMAEPreTrainedModel):
     """Slot Attention-based auto-encoder for object discovery."""
@@ -313,11 +329,11 @@ class VIT_MADVERSARY_2(ViTMAEPreTrainedModel):
 
         # masker 2
         self.masker = Masker(cfg)
-        self.optimizer_masker = torch.optim.Adam(self.masker.params_masker, lr=cfg.lr)
+        self.optimizer_masker = torch.optim.Adam(self.masker.params, lr=cfg.lr)
 
         # reconstructor
         self.reconstructor = Recon(cfg)
-        self.optimizer_recon = torch.optim.Adam(self.reconstructor.params_recon, lr=cfg.lr)
+        self.optimizer_recon = torch.optim.Adam(self.reconstructor.params, lr=cfg.lr)
 
         self.to(device)
         self.cfg = cfg
