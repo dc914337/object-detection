@@ -49,13 +49,17 @@ class Config(Namespace):
 
 
 
-class ViTMaskDecoder(nn.Module):
-    def __init__(self, config, num_patches):
+class ViTMaskDecoderCluster(nn.Module):
+    def __init__(self, config, num_patches, classes = 4):
         super().__init__()
+        self.num_classes = classes
         self.decoder_embed = nn.Linear(config.hidden_size, config.decoder_hidden_size, bias=True)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, config.decoder_hidden_size))
+        # list of class tokens
+        self.class_tokens = nn.Parameter(torch.zeros(1, classes, config.decoder_hidden_size))
+
         self.decoder_pos_embed = nn.Parameter(
-            torch.zeros(1, num_patches + 1, config.decoder_hidden_size), requires_grad=False
+            torch.zeros(1, num_patches, config.decoder_hidden_size), requires_grad=False
         )  # fixed sin-cos embedding
 
         decoder_config = deepcopy(config)
@@ -78,12 +82,14 @@ class ViTMaskDecoder(nn.Module):
     def initialize_weights(self, num_patches):
         # initialize (and freeze) position embeddings by sin-cos embedding
         decoder_pos_embed = get_2d_sincos_pos_embed(
-            self.decoder_pos_embed.shape[-1], int(num_patches**0.5), add_cls_token=True
+            self.decoder_pos_embed.shape[-1], int(num_patches**0.5), add_cls_token=False
         )
         self.decoder_pos_embed.data.copy_(torch.from_numpy(decoder_pos_embed).float().unsqueeze(0))
 
         # timm's trunc_normal_(std=.02) is effectively normal_(std=0.02) as cutoff is too big (2.)
         torch.nn.init.normal_(self.mask_token, std=self.config.initializer_range)
+
+        torch.nn.init.normal_(self.class_tokens, std=self.config.initializer_range)
 
     def forward(
         self,
@@ -97,13 +103,20 @@ class ViTMaskDecoder(nn.Module):
         x = self.decoder_embed(hidden_states)
 
         # append mask tokens to sequence
-        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
-        x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)  # no cls token
+        #mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
+        x_ = torch.cat([x[:, 1:, :]], dim=1)  # no cls token
         x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
-        x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token
+
+
+        #x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token
 
         # add pos embed
-        hidden_states = x + self.decoder_pos_embed
+        hidden_states = x_ + self.decoder_pos_embed
+
+        # append class tokens to sequence
+        class_tokens = self.decoder_embed(self.class_tokens.repeat(x.shape[0], 1, 1))
+        hidden_states = torch.cat([class_tokens, hidden_states], dim=1)
+
 
         # apply Transformer layers (blocks)
         all_hidden_states = () if output_hidden_states else None
@@ -142,7 +155,12 @@ class ViTMaskDecoder(nn.Module):
         logits = self.decoder_pred(hidden_states)
 
         # remove cls token
-        logits = logits[:, 1:, :]
+        class_tokens = logits[:, :self.num_classes, :]
+        logits = logits[:, self.num_classes:, :]
+
+        # calculate cosine similarity
+        logits = torch.einsum("bnc,bmc->bnm", [logits, class_tokens])
+        #logits = torch.softmax(logits, dim=2)
 
         if not return_dict:
             return tuple(v for v in [logits, all_hidden_states, all_self_attentions] if v is not None)
@@ -164,7 +182,7 @@ class Recon(ViTMAEPreTrainedModel):
         self.layernorm_recon = nn.LayerNorm(self.cfg_vit.hidden_size, eps=self.cfg_vit.layer_norm_eps)
         self.vit_encoder_recon = ViTMAEEncoder(self.cfg_vit)
         self.decoder_recon = ViTMAEDecoder(self.cfg_vit, num_patches=self.embeddings_recon.num_patches)
-        self.params_recon = list(list(self.embeddings_recon.parameters()) +
+        self.params = list(list(self.embeddings_recon.parameters()) +
                             list(self.layernorm_recon.parameters()) +
                             list(self.vit_encoder_recon.parameters()) +
                             list(self.decoder_recon.parameters()))
@@ -202,14 +220,24 @@ class Recon(ViTMAEPreTrainedModel):
         print("unexpected keys: ", unexpected_keys)
 
 
-class Masker(Recon):
+class Masker(ViTMAEPreTrainedModel):
     def __init__(self, cfg):
         self.cfg = cfg
-        self.cfg_vit_masker = ViTMAEConfig(**cfg.mae.dict())
-        self.cfg_vit_masker.num_channels = 4
-        super(Masker, self).__init__(cfg)
-        self.mask_decoder = ViTMaskDecoder(self.cfg_vit_masker, num_patches=self.embeddings_recon.num_patches)
-        self.params_masker = self.mask_decoder.parameters()
+        self.cfg_vit = ViTMAEConfig(**cfg.mae.dict())
+        super(Masker, self).__init__(self.cfg_vit)
+        self.embeddings_recon = ViTMAEEmbeddings(self.cfg_vit)
+        self.layernorm_recon = nn.LayerNorm(self.cfg_vit.hidden_size, eps=self.cfg_vit.layer_norm_eps)
+        self.vit_encoder_recon = ViTMAEEncoder(self.cfg_vit)
+
+        self.cfg_vit_decoder = ViTMAEConfig(**cfg.mae.dict())
+        self.cfg_vit_decoder.num_channels = 16
+        self.decoder_mask = ViTMaskDecoderCluster(self.cfg_vit_decoder, num_patches=self.embeddings_recon.num_patches)
+
+        self.params = list(list(self.embeddings_recon.parameters()) +
+                                 list(self.layernorm_recon.parameters()) +
+                                 list(self.vit_encoder_recon.parameters()) +
+                                 list(self.decoder_mask.parameters()))
+
 
     def forward(self, image, mask_ratio=0.75, temperature=1, output_attentions=False):
         B = image.shape[0]
@@ -217,9 +245,10 @@ class Masker(Recon):
         patch_size = self.cfg.mae.patch_size
 
         # encoder for mask
-        head_mask = self.get_head_mask(None, self.config.num_hidden_layers)
-        embedding_output, mask_random, ids_restore = self.embeddings_recon(image,
-                                                                            mask_ratio=0)  # inputting unmasked image
+        head_mask = self.get_head_mask(None, self.cfg_vit.num_hidden_layers)
+        embedding_output, mask_random, ids_restore = self.embeddings_recon(
+            image,
+            mask_ratio=0)  # inputting unmasked image
 
         encoder_outputs = self.vit_encoder_recon(
             embedding_output,
@@ -231,16 +260,23 @@ class Masker(Recon):
         sequence_output = self.layernorm_recon(sequence_output)
 
         # decoder for mask
-        decoder_outputs = self.mask_decoder(sequence_output,
-                                              ids_restore)  # shape (batch_size, num_patches, patch_size**2 * channels)
+        decoder_outputs = self.decoder_mask(sequence_output,
+                                            ids_restore)  # shape (batch_size, num_patches, patch_size**2 * channels)
         patch_logits = decoder_outputs.logits.reshape(B, num_patches,
                                                       4)  # shape (batch_size, num_patches, patch_size^2, 2)
         patch_mask_probs = F.gumbel_softmax(patch_logits, tau=temperature, hard=True,
                                             dim=-1)  # shape (batch_size, num_patches, patch_size, patch_size)
-        return patch_mask_probs[:, :, :], patch_logits[:, :, :]
+        return patch_mask_probs, patch_logits
 
+    def save(self, path):
+        torch.save(self.state_dict(), path)
 
-class VIT_MADVERSARY_2_slots(ViTMAEPreTrainedModel):
+    def load(self, path):
+        missing_keys, unexpected_keys = self.load_state_dict(torch.load(path), strict=False)
+        print("missing keys: ", missing_keys)
+        print("unexpected keys: ", unexpected_keys)
+
+class VIT_MADVERSARY_2_cluster(ViTMAEPreTrainedModel):
     """Slot Attention-based auto-encoder for object discovery."""
 
     @classmethod
@@ -298,26 +334,13 @@ class VIT_MADVERSARY_2_slots(ViTMAEPreTrainedModel):
         super().__init__(cfg_recon)
 
 
-        # masker
-        if False:
-            self.embeddings_masker = ViTMAEEmbeddings(cfg_masker)
-            self.layernorm_masker = nn.LayerNorm(cfg_masker.hidden_size, eps=cfg_masker.layer_norm_eps)
-            self.vit_encoder_masker = ViTMAEEncoder(cfg_masker)
-
-            self.decoder_masker = ViTMaskDecoder(cfg_masker_decoder, num_patches=self.embeddings_masker.num_patches)
-            params_masker = list(list(self.embeddings_masker.parameters()) +
-                          list(self.layernorm_masker.parameters()) +
-                          list(self.vit_encoder_masker.parameters()) +
-                          list(self.decoder_masker.parameters()))
-            self.optimizer_masker = torch.optim.Adam(params_masker, lr=cfg.lr)
-
         # masker 2
         self.masker = Masker(cfg)
-        self.optimizer_masker = torch.optim.Adam(self.masker.params_masker, lr=cfg.lr)
+        self.optimizer_masker = torch.optim.Adam(self.masker.params, lr=cfg.lr)
 
         # reconstructor
         self.reconstructor = Recon(cfg)
-        self.optimizer_recon = torch.optim.Adam(self.reconstructor.params_recon, lr=cfg.lr)
+        self.optimizer_recon = torch.optim.Adam(self.reconstructor.params, lr=cfg.lr)
 
         self.to(device)
         self.cfg = cfg
@@ -327,6 +350,17 @@ class VIT_MADVERSARY_2_slots(ViTMAEPreTrainedModel):
         if cfg.masker_path is not None:
             self.masker.load(cfg.recon_path)
 
+    def _init_weights(self, module):
+        """Initialize the weights"""
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
+            # Slightly different from the TF version which uses truncated_normal for initialization
+            # cf https://github.com/pytorch/pytorch/pull/5617
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
 
 
     def reconstruct_image_from_logits(self, logits):
@@ -412,31 +446,6 @@ class VIT_MADVERSARY_2_slots(ViTMAEPreTrainedModel):
         return loss.mean() # loss on reconstruction
 
 
-    def forward_masker(self, image, mask_ratio=0.75, temperature=1, output_attentions = False):
-        B = image.shape[0]
-        num_patches = self.embeddings_masker.num_patches
-        patch_size = self.cfg.mae.patch_size
-
-        # encoder for mask
-        head_mask = self.get_head_mask(None, self.config.num_hidden_layers)
-        embedding_output, mask_random, ids_restore = self.embeddings_masker(image, mask_ratio=0) # inputting unmasked image
-
-        encoder_outputs = self.vit_encoder_masker(
-            embedding_output,
-            head_mask=head_mask,
-            output_attentions=output_attentions,
-            output_hidden_states=False
-        )
-        sequence_output = encoder_outputs[0]
-        sequence_output = self.layernorm_masker(sequence_output)
-
-        # decoder for mask
-        decoder_outputs = self.decoder_masker(sequence_output, ids_restore) # shape (batch_size, num_patches, patch_size**2 * channels)
-        patch_logits = decoder_outputs.logits.reshape(B, num_patches, 4) # shape (batch_size, num_patches, patch_size^2, 2)
-        patch_mask_probs = F.gumbel_softmax(patch_logits, tau=temperature, hard=False, dim=-1) # shape (batch_size, num_patches, patch_size, patch_size)
-        return patch_mask_probs[:, :, 1], patch_logits[:, :, 1]
-
-
 
     def forward(self, image, mask_ratio=0.75, temperature=1., train_recon = False):
 
@@ -449,13 +458,15 @@ class VIT_MADVERSARY_2_slots(ViTMAEPreTrainedModel):
             losses_mask = 0.
         else:
             mask_prob, mask_logits = self.masker(image, mask_ratio=mask_ratio, temperature=temperature)
+            B, num_patches, classes_num = mask_prob.shape
+
 
             image_logits_list = []
             mask_learned_list = []
             loss_masked_recon = 0.
             losses_masked_recon = []
             losses_mask = 0.
-            for i in range(1, 4):
+            for i in range(1, classes_num):
                 image_logits, mask_learned = self.reconstructor(image, mask_ratio=mask_ratio, mask_noise = mask_prob[:, :, i])
                 loss_masked_recon_ = self.forward_loss(image, image_logits, mask_prob[:, :, i])
                 loss_masked_recon += loss_masked_recon_
@@ -550,6 +561,7 @@ class VIT_MADVERSARY_2_slots(ViTMAEPreTrainedModel):
             loss = -loss_masked_recon + loss_mask
             self.optimizer_masker.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.masker.params, 1e-4)
             self.optimizer_masker.step()
 
         log_dict["loss"] = loss.item()

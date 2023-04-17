@@ -7,7 +7,7 @@ from tqdm import tqdm
 import utils
 from architectures.SlotAttention_AutoEncoder import SlotAttentionAutoEncoder
 import wandb
-from architectures.VIT_MADVERSARY_2_slots import VIT_MADVERSARY_2_slots
+from architectures.VIT_MADVERSARY_2_cluster import VIT_MADVERSARY_2_cluster
 from architectures.VIT_MADVERSARY_2 import VIT_MADVERSARY_2
 from dataloaders.h5_loader import TetrominoesDataset
 
