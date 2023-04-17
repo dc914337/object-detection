@@ -518,9 +518,9 @@ class VIT_MADVERSARY_2(ViTMAEPreTrainedModel):
         #mask_ratio = min((iteration / 15000)+0.15, 0.75)
         #mask_ratio = max(1-(iteration / 15000)-0.1, 0.18)
         #mask_ratio = random.uniform(0.15, 0.85)
-        mask_ratio = 0.18 # one object
+        mask_ratio = 0.25 # one object
         #temperature = max(0.1-(iteration/10000*0.1), 0.0001)
-        temperature = max(0.1-(iteration/10000*0.1), 0.0001)
+        temperature = max(0.1-(iteration/10000*0.1), 0.03)
 
         learning_rate = learning_rate * (self.cfg.decay_rate ** (
                 iteration / self.cfg.decay_steps))
@@ -566,6 +566,7 @@ class VIT_MADVERSARY_2(ViTMAEPreTrainedModel):
             loss = -loss_masked_recon + loss_mask
             self.optimizer_masker.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.masker.params, 1e-4)
             self.optimizer_masker.step()
 
         log_dict["loss"] = loss.item()
