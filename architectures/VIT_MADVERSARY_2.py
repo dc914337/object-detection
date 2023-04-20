@@ -19,35 +19,6 @@ import math
 from copy import deepcopy
 
 
-class Config(Namespace):
-    @classmethod
-    def from_cfg(cls, cfg: Namespace):
-        n = Config()
-        for k, v in cfg.__dict__.items():
-            n.__setattr__(k, v)
-        return n
-
-    def __setattr__(self, name, value):
-        if '.' in name:
-            name = name.split('.')
-            name, rest = name[0], '.'.join(name[1:])
-            if not hasattr(self, name):
-                setattr(self, name, type(self)())
-            setattr(getattr(self, name), rest, value)
-        else:
-            super().__setattr__(name, value)
-
-    def dict(self):
-        dict = {}
-        for k, v in self.__dict__.items():
-            if isinstance(v, Config):
-                dict[k] = v.dict()
-            else:
-                dict[k] = v
-        return dict
-
-
-
 
 class ViTMaskDecoder(nn.Module):
     def __init__(self, config, num_patches):
@@ -72,7 +43,7 @@ class ViTMaskDecoder(nn.Module):
             config.decoder_hidden_size, config.num_channels, bias=True
         )  # encoder to decoder
         self.gradient_checkpointing = False
-        self.config = config
+        self.cfg = config
         self.initialize_weights(num_patches)
 
     def initialize_weights(self, num_patches):
@@ -83,7 +54,7 @@ class ViTMaskDecoder(nn.Module):
         self.decoder_pos_embed.data.copy_(torch.from_numpy(decoder_pos_embed).float().unsqueeze(0))
 
         # timm's trunc_normal_(std=.02) is effectively normal_(std=0.02) as cutoff is too big (2.)
-        torch.nn.init.normal_(self.mask_token, std=self.config.initializer_range)
+        torch.nn.init.normal_(self.mask_token, std=self.cfg.initializer_range)
 
     def forward(
         self,
@@ -157,7 +128,7 @@ class ViTMaskDecoder(nn.Module):
 class Recon(ViTMAEPreTrainedModel):
     def __init__(self, cfg):
         self.cfg = cfg
-        self.cfg_vit = ViTMAEConfig(**cfg.mae.dict())
+        self.cfg_vit = ViTMAEConfig(**cfg.dict())
         super(Recon, self).__init__(self.cfg_vit)
 
         self.embeddings_recon = ViTMAEEmbeddings(self.cfg_vit)
@@ -190,7 +161,7 @@ class Recon(ViTMAEPreTrainedModel):
 
         # decoder for reconstruction
         decoder_outputs = self.decoder_recon(sequence_output, ids_restore)
-        logits = decoder_outputs.logits.reshape(B, num_patches, self.cfg.mae.patch_size, self.cfg.mae.patch_size, 3)  # shape (batch_size, num_patches, patch_size, patch_size) - mask
+        logits = decoder_outputs.logits.reshape(B, num_patches, self.cfg.patch_size, self.cfg.patch_size, 3)  # shape (batch_size, num_patches, patch_size, patch_size) - mask
 
         return logits.reshape(B, num_patches, -1), mask_learned
     def save(self, path):
@@ -205,14 +176,15 @@ class Recon(ViTMAEPreTrainedModel):
 class Masker(ViTMAEPreTrainedModel):
     def __init__(self, cfg):
         self.cfg = cfg
-        self.cfg_vit = ViTMAEConfig(**cfg.mae.dict())
+        self.cfg_vit = ViTMAEConfig(**cfg.dict())
         super(Masker, self).__init__(self.cfg_vit)
         self.embeddings_recon = ViTMAEEmbeddings(self.cfg_vit)
         self.layernorm_recon = nn.LayerNorm(self.cfg_vit.hidden_size, eps=self.cfg_vit.layer_norm_eps)
         self.vit_encoder_recon = ViTMAEEncoder(self.cfg_vit)
 
-        self.cfg_vit_decoder = ViTMAEConfig(**cfg.mae.dict())
-        self.cfg_vit_decoder.num_channels = 4
+        # decoder for masker
+        self.cfg_vit_decoder = ViTMAEConfig(**cfg.dict())
+        self.cfg_vit_decoder.num_channels = cfg.decoder_num_classes
         self.decoder_mask = ViTMaskDecoder(self.cfg_vit_decoder, num_patches=self.embeddings_recon.num_patches)
 
         self.params = list(list(self.embeddings_recon.parameters()) +
@@ -224,7 +196,7 @@ class Masker(ViTMAEPreTrainedModel):
     def forward(self, image, mask_ratio=0.75, temperature=1, output_attentions=False):
         B = image.shape[0]
         num_patches = self.embeddings_recon.num_patches
-        patch_size = self.cfg.mae.patch_size
+        patch_size = self.cfg.patch_size
 
         # encoder for mask
         head_mask = self.get_head_mask(None, self.cfg_vit.num_hidden_layers)
@@ -256,7 +228,67 @@ class Masker(ViTMAEPreTrainedModel):
         print("missing keys: ", missing_keys)
         print("unexpected keys: ", unexpected_keys)
 
-class VIT_MADVERSARY_2(ViTMAEPreTrainedModel):
+
+
+def reconstruct_image_from_logits(logits, patch_size, img_size, device):
+    """Reconstructs an image from logits.
+    Args:
+    logits: Tensor of shape [B, H, W, C] containing logits.
+    Returns:
+    Tensor of shape [B, H, W, C] containing the reconstructed image.
+    """
+    patched_pixels = torch.sigmoid(logits)
+    batch_size = logits.shape[0]
+    num_patches = int(math.sqrt(logits.shape[1]))
+    patches = patched_pixels.reshape(batch_size,
+                                     num_patches,
+                                     num_patches,
+                                     patch_size,
+                                     patch_size,
+                                     3)
+    image = torch.zeros(batch_size, img_size, img_size, 3).to(device)
+    for i in range(num_patches):
+        for j in range(num_patches):
+            image[:,
+            i * patch_size:(i + 1) * patch_size,
+            j * patch_size:(j + 1) * patch_size, :] = patches[:, i, j, :, :, :]
+    return image
+
+def patchify(pixel_values, patch_size, num_channels):
+    """
+    Args:
+        pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)`):
+            Pixel values.
+
+    Returns:
+        `torch.FloatTensor` of shape `(batch_size, num_patches, patch_size**2 * num_channels)`:
+            Patchified pixel values.
+    """
+    patch_size, num_channels = patch_size, num_channels
+    # sanity checks
+    if (pixel_values.shape[2] != pixel_values.shape[3]) or (pixel_values.shape[2] % patch_size != 0):
+        raise ValueError("Make sure the pixel values have a squared size that is divisible by the patch size")
+    if pixel_values.shape[1] != num_channels:
+        raise ValueError(
+            "Make sure the number of channels of the pixel values is equal to the one set in the configuration"
+        )
+
+    # patchify
+    batch_size = pixel_values.shape[0]
+    num_patches_one_direction = pixel_values.shape[2] // patch_size
+    patchified_pixel_values = pixel_values.reshape(
+        batch_size, num_channels, num_patches_one_direction, patch_size, num_patches_one_direction, patch_size
+    )
+    patchified_pixel_values = torch.einsum("nchpwq->nhwpqc", patchified_pixel_values)
+    patchified_pixel_values = patchified_pixel_values.reshape(
+        batch_size, num_patches_one_direction * num_patches_one_direction, patch_size ** 2 * num_channels
+    )
+    return patchified_pixel_values
+
+
+
+
+class VIT_MADVERSARY_2(nn.Module):
     """Slot Attention-based auto-encoder for object discovery."""
 
     @classmethod
@@ -303,104 +335,25 @@ class VIT_MADVERSARY_2(ViTMAEPreTrainedModel):
         num_slots: Number of slots in Slot Attention.
         num_iterations: Number of iterations in Slot Attention.
         """
+        super().__init__()
         cfg.model = self.__class__.__name__
-        cfg = Config.from_cfg(cfg)
-        cfg_masker = ViTMAEConfig(**cfg.mae.dict())
-        cfg_masker_decoder = ViTMAEConfig(**cfg.mae.dict())
-        cfg_masker_decoder.num_channels = 4 # 0 - no mask, 1 - mask
-
-
-        cfg_recon = ViTMAEConfig(**cfg.mae.dict())
-        super().__init__(cfg_recon)
-
-
-        # masker
-        if False:
-            self.embeddings_masker = ViTMAEEmbeddings(cfg_masker)
-            self.layernorm_masker = nn.LayerNorm(cfg_masker.hidden_size, eps=cfg_masker.layer_norm_eps)
-            self.vit_encoder_masker = ViTMAEEncoder(cfg_masker)
-
-            self.decoder_masker = ViTMaskDecoder(cfg_masker_decoder, num_patches=self.embeddings_masker.num_patches)
-            params_masker = list(list(self.embeddings_masker.parameters()) +
-                          list(self.layernorm_masker.parameters()) +
-                          list(self.vit_encoder_masker.parameters()) +
-                          list(self.decoder_masker.parameters()))
-            self.optimizer_masker = torch.optim.Adam(params_masker, lr=cfg.lr)
+        self.cfg = cfg
+        self.device = device
 
         # masker 2
-        self.masker = Masker(cfg)
+        self.masker = Masker(cfg.masker_mae)
         self.optimizer_masker = torch.optim.Adam(self.masker.params, lr=cfg.lr)
 
         # reconstructor
-        self.reconstructor = Recon(cfg)
+        self.reconstructor = Recon(cfg.reconstructor_mae)
         self.optimizer_recon = torch.optim.Adam(self.reconstructor.params, lr=cfg.lr)
 
         self.to(device)
-        self.cfg = cfg
         self.train_mask = False
-        if cfg.recon_path is not None:
-            self.reconstructor.load(cfg.recon_path)
-        if cfg.masker_path is not None:
-            self.masker.load(cfg.recon_path)
-
-
-
-    def reconstruct_image_from_logits(self, logits):
-        """Reconstructs an image from logits.
-        Args:
-        logits: Tensor of shape [B, H, W, C] containing logits.
-        Returns:
-        Tensor of shape [B, H, W, C] containing the reconstructed image.
-        """
-        patched_pixels = torch.sigmoid(logits)
-        batch_size = logits.shape[0]
-        num_patches = int(math.sqrt(logits.shape[1]))
-        patches = patched_pixels.reshape(batch_size,
-                                    num_patches,
-                                    num_patches,
-                                    self.cfg.mae.patch_size,
-                                    self.cfg.mae.patch_size,
-                                    3)
-        image = torch.zeros(batch_size, self.cfg.mae.image_size, self.cfg.mae.image_size, 3).to(self.device)
-        for i in range(num_patches):
-            for j in range(num_patches):
-                image[:,
-                i*self.cfg.mae.patch_size:(i+1)*self.cfg.mae.patch_size,
-                j*self.cfg.mae.patch_size:(j+1)*self.cfg.mae.patch_size, :] = patches[:, i, j, :, :, :]
-        return image
-
-
-    def patchify(self, pixel_values):
-        """
-        Args:
-            pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)`):
-                Pixel values.
-
-        Returns:
-            `torch.FloatTensor` of shape `(batch_size, num_patches, patch_size**2 * num_channels)`:
-                Patchified pixel values.
-        """
-        patch_size, num_channels = self.config.patch_size, self.config.num_channels
-        # sanity checks
-        if (pixel_values.shape[2] != pixel_values.shape[3]) or (pixel_values.shape[2] % patch_size != 0):
-            raise ValueError("Make sure the pixel values have a squared size that is divisible by the patch size")
-        if pixel_values.shape[1] != num_channels:
-            raise ValueError(
-                "Make sure the number of channels of the pixel values is equal to the one set in the configuration"
-            )
-
-        # patchify
-        batch_size = pixel_values.shape[0]
-        num_patches_one_direction = pixel_values.shape[2] // patch_size
-        patchified_pixel_values = pixel_values.reshape(
-            batch_size, num_channels, num_patches_one_direction, patch_size, num_patches_one_direction, patch_size
-        )
-        patchified_pixel_values = torch.einsum("nchpwq->nhwpqc", patchified_pixel_values)
-        patchified_pixel_values = patchified_pixel_values.reshape(
-            batch_size, num_patches_one_direction * num_patches_one_direction, patch_size**2 * num_channels
-        )
-        return patchified_pixel_values
-
+        if cfg.reconstructor_mae.pretrained_path is not None:
+            self.reconstructor.load(cfg.reconstructor_mae.pretrained_path)
+        if cfg.masker_mae.pretrained_path is not None:
+            self.masker.load(cfg.masker_mae.pretrained_path)
 
     def forward_loss(self, pixel_values, pred, mask):
         """
@@ -415,8 +368,8 @@ class VIT_MADVERSARY_2(ViTMAEPreTrainedModel):
         Returns:
             `torch.FloatTensor`: Pixel reconstruction loss.
         """
-        target = self.patchify(pixel_values)
-        if self.config.norm_pix_loss:
+        target = patchify(pixel_values, self.cfg.patch_size, num_channels=3)
+        if self.cfg.norm_pix_loss:
             mean = target.mean(dim=-1, keepdim=True)
             var = target.var(dim=-1, keepdim=True)
             target = (target - mean) / (var + 1.0e-6) ** 0.5
@@ -426,32 +379,6 @@ class VIT_MADVERSARY_2(ViTMAEPreTrainedModel):
 
         loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
         return loss.mean() # loss on reconstruction
-
-
-    def forward_masker(self, image, mask_ratio=0.75, temperature=1, output_attentions = False):
-        B = image.shape[0]
-        num_patches = self.embeddings_masker.num_patches
-        patch_size = self.cfg.mae.patch_size
-
-        # encoder for mask
-        head_mask = self.get_head_mask(None, self.config.num_hidden_layers)
-        embedding_output, mask_random, ids_restore = self.embeddings_masker(image, mask_ratio=0) # inputting unmasked image
-
-        encoder_outputs = self.vit_encoder_masker(
-            embedding_output,
-            head_mask=head_mask,
-            output_attentions=output_attentions,
-            output_hidden_states=False
-        )
-        sequence_output = encoder_outputs[0]
-        sequence_output = self.layernorm_masker(sequence_output)
-
-        # decoder for mask
-        decoder_outputs = self.decoder_masker(sequence_output, ids_restore) # shape (batch_size, num_patches, patch_size**2 * channels)
-        patch_logits = decoder_outputs.logits.reshape(B, num_patches, 4) # shape (batch_size, num_patches, patch_size^2, 2)
-        patch_mask_probs = F.gumbel_softmax(patch_logits, tau=temperature, hard=False, dim=-1) # shape (batch_size, num_patches, patch_size, patch_size)
-        return patch_mask_probs[:, :, 1], patch_logits[:, :, 1]
-
 
 
     def forward(self, image, mask_ratio=0.75, temperature=1., train_recon = False):
@@ -515,12 +442,14 @@ class VIT_MADVERSARY_2(ViTMAEPreTrainedModel):
             learning_rate = self.cfg.lr * (iteration / self.cfg.warmup_steps)
         else:
             learning_rate = self.cfg.lr
+
         #mask_ratio = min((iteration / 15000)+0.15, 0.75)
         #mask_ratio = max(1-(iteration / 15000)-0.1, 0.18)
         #mask_ratio = random.uniform(0.15, 0.85)
-        mask_ratio = 0.25 # one object
+        mask_ratio = self.cfg.object_size # one object
+
         #temperature = max(0.1-(iteration/10000*0.1), 0.0001)
-        temperature = max(0.1-(iteration/10000*0.1), 0.03)
+        temperature = self.cfg.temperature #max(0.1-(iteration/10000*0.1), 0.03)
 
         learning_rate = learning_rate * (self.cfg.decay_rate ** (
                 iteration / self.cfg.decay_steps))
@@ -590,7 +519,10 @@ class VIT_MADVERSARY_2(ViTMAEPreTrainedModel):
         recons_masked_imgs = []
         for i in range(res_dict["logits_masked_img"].shape[3]):
             logits_masked_img = res_dict["logits_masked_img"][:batch_size, :, :, i]
-            recons_masked = self.reconstruct_image_from_logits(logits_masked_img) # B, H, W, C
+            recons_masked = reconstruct_image_from_logits(logits_masked_img,
+                                                          patch_size = self.cfg.patch_size,
+                                                          img_size = self.cfg.image_size,
+                                                          device=self.device) # B, H, W, C
             recons_masked = normalize(recons_masked.cpu().detach().numpy())  # B, H, W, C
             recons_masked_imgs.append(recons_masked)
 
@@ -600,7 +532,7 @@ class VIT_MADVERSARY_2(ViTMAEPreTrainedModel):
         titles = ["image", "mask logits 1", "real mask 1", "recon 1", "mask logits 2", "real mask 2", "recon 2", "mask logits 3","real mask 3", "recon 3"]
         fig, ax = plt.subplots(batch_size, len(titles), figsize=(20, 9))
 
-        patch_size = self.cfg.mae.patch_size
+        patch_size = self.cfg.patch_size
         img_size = image.shape[1]
         patches_num = img_size//patch_size
 

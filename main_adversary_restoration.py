@@ -9,6 +9,7 @@ from architectures.SlotAttention_AutoEncoder import SlotAttentionAutoEncoder
 import wandb
 from architectures.VIT_MADVERSARY_2_cluster import VIT_MADVERSARY_2_cluster
 from architectures.VIT_MADVERSARY_2 import VIT_MADVERSARY_2
+from configs.uconfig import YamlConfig
 from dataloaders.h5_loader import TetrominoesDataset
 
 torch.multiprocessing.set_sharing_strategy('file_system')
@@ -22,20 +23,36 @@ def main():
     """ARGUMENTS"""
     parser = ArgumentParser()
     parser.add_argument('--output_dir', type=str, default="outputs")
-    parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--visualize_freq', type=int, default=300)
-    parser.add_argument('--eval_freq', type=int, default=2500)
-    parser.add_argument('--dataset_path', type=str, default="data/EMORL/tetrominoes.h5")
-    parser.add_argument('--DEBUG', action='store_true', default=False)
+    parser.add_argument('--config_path', type=str, default="configs/vit_madversary_clustering.yaml")
+
+    parser.add_argument('--batch_size', type=int)
+    parser.add_argument('--visualize_freq', type=int)
+    parser.add_argument('--eval_freq', type=int)
+    parser.add_argument('--dataset_path', type=str)
+    parser.add_argument('--DEBUG', type=bool, default=False)
     MODEL_CLASS.add_argparse_args(parser)
-    cfg = parser.parse_args()
+    cfg_args = parser.parse_args()
+
+
+    cfg = YamlConfig(cfg_args.config_path)
+    # merge config with arguments
+    cfg.output_dir = cfg_args.output_dir or cfg.output_dir
+    cfg.batch_size = cfg_args.batch_size or cfg.batch_size
+    cfg.visualize_freq = cfg_args.visualize_freq or cfg.visualize_freq
+    cfg.eval_freq = cfg_args.eval_freq or cfg.eval_freq
+    cfg.dataset_path = cfg_args.dataset_path or cfg.dataset_path
+    cfg.DEBUG = cfg_args.DEBUG or cfg.DEBUG
+
+
 
     """LOGGING"""
-    wandb.init(project="Motion-conditioned-object-detection", entity="aalto", config=cfg.__dict__)
+    wandb.init(project="Motion-conditioned-object-detection", entity="aalto", config=cfg.dict())
+    wandb.run.log_code(".")
 
     """MODEL"""
     device = torch.device("cuda")
-    model = MODEL_CLASS(cfg, device=device)
+
+    model = MODEL_CLASS(cfg.VIT_MADVERSARY_2, device=device)
 
     # calculate total parameters of all models
     pytorch_total_params = sum(p.numel() for p in model.parameters())

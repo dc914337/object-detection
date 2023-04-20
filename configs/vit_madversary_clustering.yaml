@@ -1,0 +1,67 @@
+
+resolution: &resolution 36
+patch_size: &patch_size 3
+num_classes: &num_classes 4
+
+VIT_MADVERSARY_2:
+  image_size: *resolution
+  patch_size: *patch_size
+  num_classes: *num_classes
+
+  # masker
+  masker_mae:
+    image_size: *resolution
+    patch_size: *patch_size
+
+    num_hidden_layers: 3
+    num_attention_heads: 4
+    hidden_size: 128
+
+    intermediate_size: 260
+
+    decoder_intermediate_size: 130
+    decoder_num_hidden_layers: 3
+    decoder_num_attention_heads: 4
+    decoder_hidden_size: 128
+
+    # custom parameter
+    decoder_num_classes: 4
+
+    pretrained_path: null
+
+  # reconstructor
+  reconstructor_mae:
+    image_size: *resolution
+    patch_size: *patch_size
+
+    num_hidden_layers: 5
+    num_attention_heads: 8
+    hidden_size: 512
+
+    intermediate_size: 1024
+
+    decoder_intermediate_size: 512
+    decoder_num_hidden_layers: 5
+    decoder_num_attention_heads: 8
+    decoder_hidden_size: 512
+
+    #mask_ratio: 0.75
+    pretrained_path: "./checkpoints/recon_madversary_2_small_551.pt"
+
+
+  object_size: 0.18
+  temperature: 0.05
+  lr: 2.e-4
+  warmup_steps: 200
+  decay_rate: 0.5
+  decay_steps: 50000
+  norm_pix_loss: False
+
+# training
+visualize_freq: 300
+eval_freq: 2500
+dataset_path: "data/EMORL/tetrominoes.h5"
+batch_size: 16
+DEBUG: False
+
+comment: "Rerunning with parameters of 84qwcdmk with config"

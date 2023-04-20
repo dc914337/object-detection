@@ -6,6 +6,7 @@ from torch import nn as nn
 from torch.nn import functional as F
 
 from architectures.slot_attention.slot_attention import Encoder, Decoder, SlotAttention
+from configs.uconfig import YamlConfig
 from utils import normalize
 import matplotlib.pyplot as plt
 from PIL import Image as Image, ImageEnhance
@@ -89,7 +90,6 @@ class VIT_MAE(nn.Module):
         """
         super().__init__()
         cfg.model = self.__class__.__name__
-        cfg = Config.from_cfg(cfg)
 
         t_cfg = ViTMAEConfig(**cfg.mae.dict())
         self.transformer = ViTMAEForPreTraining(t_cfg)
