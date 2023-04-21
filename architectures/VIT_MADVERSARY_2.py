@@ -148,7 +148,8 @@ class Recon(ViTMAEPreTrainedModel):
 
         head_mask = self.get_head_mask(None, self.cfg_vit.num_hidden_layers)
         embedding_output, mask_learned, ids_restore = self.embeddings_recon(image, mask_ratio=mask_ratio,
-                                                                      noise=mask_noise)
+                                                                      noise=mask_noise,
+                                                                      padded=True)
 
         encoder_outputs = self.vit_encoder_recon(
             embedding_output,
@@ -178,38 +179,39 @@ class Masker(ViTMAEPreTrainedModel):
         self.cfg = cfg
         self.cfg_vit = ViTMAEConfig(**cfg.dict())
         super(Masker, self).__init__(self.cfg_vit)
-        self.embeddings_recon = ViTMAEEmbeddings(self.cfg_vit)
-        self.layernorm_recon = nn.LayerNorm(self.cfg_vit.hidden_size, eps=self.cfg_vit.layer_norm_eps)
-        self.vit_encoder_recon = ViTMAEEncoder(self.cfg_vit)
+
+        self.embeddings_mask = ViTMAEEmbeddings(self.cfg_vit)
+        self.layernorm_mask = nn.LayerNorm(self.cfg_vit.hidden_size, eps=self.cfg_vit.layer_norm_eps)
+        self.vit_encoder_mask = ViTMAEEncoder(self.cfg_vit)
 
         # decoder for masker
         self.cfg_vit_decoder = ViTMAEConfig(**cfg.dict())
         self.cfg_vit_decoder.num_channels = cfg.decoder_num_classes
-        self.decoder_mask = ViTMaskDecoder(self.cfg_vit_decoder, num_patches=self.embeddings_recon.num_patches)
+        self.decoder_mask = ViTMaskDecoder(self.cfg_vit_decoder, num_patches=self.embeddings_mask.num_patches)
 
-        self.params = list(list(self.embeddings_recon.parameters()) +
-                                 list(self.layernorm_recon.parameters()) +
-                                 list(self.vit_encoder_recon.parameters()) +
-                                 list(self.decoder_mask.parameters()))
+        self.params = list(list(self.embeddings_mask.parameters()) +
+                           list(self.layernorm_mask.parameters()) +
+                           list(self.vit_encoder_mask.parameters()) +
+                           list(self.decoder_mask.parameters()))
 
 
     def forward(self, image, mask_ratio=0.75, temperature=1, output_attentions=False):
         B = image.shape[0]
-        num_patches = self.embeddings_recon.num_patches
+        num_patches = self.embeddings_mask.num_patches
         patch_size = self.cfg.patch_size
 
         # encoder for mask
         head_mask = self.get_head_mask(None, self.cfg_vit.num_hidden_layers)
-        embedding_output, mask_random, ids_restore = self.embeddings_recon(image, mask_ratio=0)  # inputting unmasked image
+        embedding_output, mask_random, ids_restore = self.embeddings_mask(image, mask_ratio=0)  # inputting unmasked image
 
-        encoder_outputs = self.vit_encoder_recon(
+        encoder_outputs = self.vit_encoder_mask(
             embedding_output,
             head_mask=head_mask,
             output_attentions=output_attentions,
             output_hidden_states=False
         )
         sequence_output = encoder_outputs[0]
-        sequence_output = self.layernorm_recon(sequence_output)
+        sequence_output = self.layernorm_mask(sequence_output)
 
         # decoder for mask
         decoder_outputs = self.decoder_mask(sequence_output,
@@ -377,19 +379,27 @@ class VIT_MADVERSARY_2(nn.Module):
         loss = (pred - target) ** 2
         loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
 
-        loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
+        nonzero_mask = (mask.sum(dim=1) != 0.) # some of the items may be zero
+        if not nonzero_mask.any():
+            return 0.
+        loss = (loss * mask)[nonzero_mask].sum(dim=1) / mask[nonzero_mask].sum(dim=1)  # mean loss on removed patches
         return loss.mean() # loss on reconstruction
 
 
     def forward(self, image, mask_ratio=0.75, temperature=1., train_recon = False):
-
+        B, C, H, W = image.shape
         if train_recon:
             image_logits, mask_learned = self.reconstructor(image, mask_ratio=mask_ratio, mask_noise=None)
             loss_masked_recon = self.forward_loss(image, image_logits, mask_learned)
             mask_prob = mask_learned
             mask_logits = mask_prob
-            losses_masked_recon = [loss_masked_recon]
+            losses_masked_recon = [loss_masked_recon]*4
             losses_mask = 0.
+
+            # hack
+            image_logits = image_logits.reshape(B, 144, 27, 1).expand(-1, -1, -1, 3)
+            mask_learned = mask_learned.reshape(B, 144, 1).expand(-1, -1, 4)
+            mask_logits = mask_logits.reshape(B, 144, 1).expand(-1, -1, 4)
         else:
             mask_prob, mask_logits = self.masker(image, mask_ratio=mask_ratio, temperature=temperature)
 
@@ -400,6 +410,7 @@ class VIT_MADVERSARY_2(nn.Module):
             losses_mask = 0.
             for i in range(1, 4):
                 image_logits, mask_learned = self.reconstructor(image, mask_ratio=mask_ratio, mask_noise = mask_prob[:, :, i])
+
                 loss_masked_recon_ = self.forward_loss(image, image_logits, mask_prob[:, :, i])
                 loss_masked_recon += loss_masked_recon_
                 losses_masked_recon.append(loss_masked_recon_)
@@ -446,7 +457,10 @@ class VIT_MADVERSARY_2(nn.Module):
         #mask_ratio = min((iteration / 15000)+0.15, 0.75)
         #mask_ratio = max(1-(iteration / 15000)-0.1, 0.18)
         #mask_ratio = random.uniform(0.15, 0.85)
-        mask_ratio = self.cfg.object_size # one object
+        if train_recon:
+            mask_ratio = random.uniform(0.15, 0.85)
+        else:
+            mask_ratio = self.cfg.object_size # one object
 
         #temperature = max(0.1-(iteration/10000*0.1), 0.0001)
         temperature = self.cfg.temperature #max(0.1-(iteration/10000*0.1), 0.03)
@@ -494,7 +508,9 @@ class VIT_MADVERSARY_2(nn.Module):
         else:
             loss = -loss_masked_recon + loss_mask
             self.optimizer_masker.zero_grad()
-            loss.backward()
+            a=True
+            if a:
+                loss.backward()
             torch.nn.utils.clip_grad_norm_(self.masker.params, 1e-4)
             self.optimizer_masker.step()
 
@@ -529,7 +545,7 @@ class VIT_MADVERSARY_2(nn.Module):
         masks_learned = res_dict["mask_learned"][:batch_size]
 
 
-        titles = ["image", "mask logits 1", "real mask 1", "recon 1", "mask logits 2", "real mask 2", "recon 2", "mask logits 3","real mask 3", "recon 3"]
+        titles = ["image", "mask logits 1", "masked 1", "recon 1", "mask logits 2", "masked 2", "recon 2", "mask logits 3","masked 3", "recon 3"]
         fig, ax = plt.subplots(batch_size, len(titles), figsize=(20, 9))
 
         patch_size = self.cfg.patch_size
@@ -553,7 +569,7 @@ class VIT_MADVERSARY_2(nn.Module):
 
 
             for i in range(len(recons_masked_imgs)):
-                ax[batch_id, i*3+1].imshow(mask_logits[batch_id, :, i+1].reshape(patches_num, patches_num))
+                ax[batch_id, i*3+1].imshow(mask_logits[batch_id, :, i+1].reshape(patches_num, patches_num), vmin=0, vmax=1)
                 ax[batch_id, i*3+1].grid(False)
                 ax[batch_id, i*3+1].axis('off')
 
@@ -565,7 +581,7 @@ class VIT_MADVERSARY_2(nn.Module):
                 masked_input_learned = (1 - mask_learned) * image
 
 
-                ax[batch_id, i*3+2].imshow(mask_learned[batch_id])
+                ax[batch_id, i*3+2].imshow(masked_input_learned[batch_id] + mask_learned[batch_id])
                 ax[batch_id, i*3+2].grid(False)
                 ax[batch_id, i*3+2].axis('off')
 

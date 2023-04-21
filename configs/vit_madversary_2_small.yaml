@@ -34,19 +34,18 @@ VIT_MADVERSARY_2:
     image_size: *resolution
     patch_size: *patch_size
 
-    num_hidden_layers: 5
-    num_attention_heads: 8
-    hidden_size: 512
+    num_hidden_layers: 3
+    num_attention_heads: 4
+    hidden_size: 128
 
-    intermediate_size: 1024
+    intermediate_size: 260
 
-    decoder_intermediate_size: 512
-    decoder_num_hidden_layers: 5
-    decoder_num_attention_heads: 8
-    decoder_hidden_size: 512
+    decoder_intermediate_size: 130
+    decoder_num_hidden_layers: 3
+    decoder_num_attention_heads: 4
+    decoder_hidden_size: 128
 
-    #mask_ratio: 0.75
-    pretrained_path: "./checkpoints/recon_madversary_2_small_551.pt"
+    pretrained_path: "./checkpoints/tiny recon/recon_madversary_2_10000.pt"
 
 
   object_size: 0.18
@@ -61,7 +60,8 @@ VIT_MADVERSARY_2:
 visualize_freq: 300
 eval_freq: 2500
 dataset_path: "data/EMORL/tetrominoes.h5"
-batch_size: 16
+batch_size: 90
 DEBUG: False
 
-comment: "Rerunning with parameters of 84qwcdmk with config"
+notes: "Training small masker with small reconstructor"
+train_recon: False

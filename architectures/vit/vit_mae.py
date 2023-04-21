@@ -206,6 +206,9 @@ class ViTMAEEmbeddings(nn.Module):
         super().__init__()
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
+        self.pad_token = nn.Parameter(torch.zeros(1, config.hidden_size), requires_grad=False)
+
+
         self.patch_embeddings = ViTMAEPatchEmbeddings(config)
         self.num_patches = self.patch_embeddings.num_patches
         # fixed sin-cos embedding
@@ -228,6 +231,7 @@ class ViTMAEEmbeddings(nn.Module):
 
         # timm's trunc_normal_(std=.02) is effectively normal_(std=0.02) as cutoff is too big (2.)
         torch.nn.init.normal_(self.cls_token, std=self.config.initializer_range)
+        torch.nn.init.normal_(self.pad_token, std=self.config.initializer_range)
 
     def random_masking(self, sequence, random_mask_ratio, noise=None):
         """
@@ -262,9 +266,46 @@ class ViTMAEEmbeddings(nn.Module):
         return sequence_unmasked, mask, ids_restore
 
 
+    def padded_masking(self, sequence, random_mask_ratio, noise):
+        """
+        Perform per-sample random masking by per-sample shuffling. Per-sample shuffling is done by argsort random
+        noise.
+
+        Args:
+            sequence (`torch.LongTensor` of shape `(batch_size, sequence_length, dim)`)
+            noise (`torch.FloatTensor` of shape `(batch_size, sequence_length)`, *optional*) which is
+                mainly used for testing purposes to control randomness and maintain the reproducibility
+        """
+        batch_size, seq_length, dim = sequence.shape
+        len_keep = int(seq_length)
+        if noise is None:
+            noise = (torch.rand(batch_size, seq_length, device=sequence.device) <= random_mask_ratio).to(torch.float)  # noise in [0, 1]
+
+        noise_token = noise.reshape(batch_size, seq_length, 1)
+        # apply mask
+        sequence_masked = sequence * (1.-noise_token) + noise_token * self.pad_token.reshape(1, 1, dim)
+
+        # sort noise for each sample
+        ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
 
 
-    def forward(self, pixel_values, mask_ratio=0., noise=None):
+        # keep the first subset
+        ids_keep = ids_shuffle[:, :len_keep]
+        sequence_unmasked = torch.gather(sequence_masked, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, dim))
+
+        # generate the binary mask: 0 is keep, 1 is remove
+        #mask = torch.ones([batch_size, seq_length], device=sequence_masked.device)
+        #mask[:, :len_keep] = 0
+        # unshuffle to get the binary mask
+        #mask = torch.gather(mask, dim=1, index=ids_restore)
+
+        return sequence_unmasked, noise, ids_restore
+
+
+
+
+    def forward(self, pixel_values, mask_ratio=0., noise=None, padded = False):
         batch_size, num_channels, height, width = pixel_values.shape
         embeddings = self.patch_embeddings(pixel_values)
 
@@ -272,7 +313,10 @@ class ViTMAEEmbeddings(nn.Module):
         embeddings = embeddings + self.position_embeddings[:, 1:, :]
 
         # masking: length -> length * mask_ratio
-        embeddings, mask, ids_restore = self.random_masking(embeddings, random_mask_ratio=mask_ratio, noise=noise)
+        if padded:
+            embeddings, mask, ids_restore = self.padded_masking(embeddings, random_mask_ratio=mask_ratio, noise=noise)
+        else:
+            embeddings, mask, ids_restore = self.random_masking(embeddings, random_mask_ratio=mask_ratio, noise=noise)
 
         # append cls token
         cls_token = self.cls_token + self.position_embeddings[:, :1, :]

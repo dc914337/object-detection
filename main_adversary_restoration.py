@@ -46,7 +46,7 @@ def main():
 
 
     """LOGGING"""
-    wandb.init(project="Motion-conditioned-object-detection", entity="aalto", config=cfg.dict())
+    wandb.init(project="Motion-conditioned-object-detection", entity="aalto", notes=cfg.notes, config=cfg.dict())
     wandb.run.log_code(".")
 
     """MODEL"""
@@ -79,7 +79,7 @@ def main():
 
                 visualize = (iteration % cfg.visualize_freq == 0) or (iteration in [3, 50, 100, 300, 500])
 
-                train_log_dict = model.train_step(batch, iteration, total_iter, visualize=visualize)
+                train_log_dict = model.train_step(batch, iteration, total_iter, visualize=visualize, train_recon=cfg.train_recon)
                 # todo: delete train_log_dict values to free memory
 
                 train_log_dict["epoch"] = epoch
