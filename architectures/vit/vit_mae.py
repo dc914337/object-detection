@@ -206,7 +206,7 @@ class ViTMAEEmbeddings(nn.Module):
         super().__init__()
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
-        self.pad_token = nn.Parameter(torch.zeros(1, config.hidden_size), requires_grad=False)
+        self.pad_token = nn.Parameter(torch.zeros(1, config.hidden_size))
 
 
         self.patch_embeddings = ViTMAEPatchEmbeddings(config)
@@ -286,13 +286,8 @@ class ViTMAEEmbeddings(nn.Module):
         sequence_masked = sequence * (1.-noise_token) + noise_token * self.pad_token.reshape(1, 1, dim)
 
         # sort noise for each sample
-        ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
-        ids_restore = torch.argsort(ids_shuffle, dim=1)
-
-
-        # keep the first subset
-        ids_keep = ids_shuffle[:, :len_keep]
-        sequence_unmasked = torch.gather(sequence_masked, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, dim))
+        ids_restore = torch.arange(0, seq_length, device=sequence.device).repeat(batch_size, 1)
+        sequence_unmasked = torch.gather(sequence_masked, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, dim))
 
         # generate the binary mask: 0 is keep, 1 is remove
         #mask = torch.ones([batch_size, seq_length], device=sequence_masked.device)

@@ -55,7 +55,7 @@ def main():
     model = MODEL_CLASS(cfg.VIT_MADVERSARY_2, device=device)
 
     # calculate total parameters of all models
-    pytorch_total_params = sum(p.numel() for p in model.parameters())
+    pytorch_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total parameters: {pytorch_total_params}")
 
     train_loader = torch.utils.data.DataLoader(

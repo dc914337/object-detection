@@ -147,6 +147,8 @@ class Recon(ViTMAEPreTrainedModel):
 
 
         head_mask = self.get_head_mask(None, self.cfg_vit.num_hidden_layers)
+
+        #full_mask = mask_noise[:,torch.randperm(144)]
         embedding_output, mask_learned, ids_restore = self.embeddings_recon(image, mask_ratio=mask_ratio,
                                                                       noise=mask_noise,
                                                                       padded=True)
@@ -357,6 +359,9 @@ class VIT_MADVERSARY_2(nn.Module):
         if cfg.masker_mae.pretrained_path is not None:
             self.masker.load(cfg.masker_mae.pretrained_path)
 
+        for param in self.reconstructor.parameters():
+            param.requires_grad = False
+
     def forward_loss(self, pixel_values, pred, mask):
         """
         Args:
@@ -381,8 +386,11 @@ class VIT_MADVERSARY_2(nn.Module):
 
         nonzero_mask = (mask.sum(dim=1) != 0.) # some of the items may be zero
         if not nonzero_mask.any():
-            return 0.
-        loss = (loss * mask)[nonzero_mask].sum(dim=1) / mask[nonzero_mask].sum(dim=1)  # mean loss on removed patches
+            return 0.  # if all masks are empty - we can't calculate the loss
+        #loss = (loss * mask)[nonzero_mask].mean()   #/ mask[nonzero_mask].sum(dim=1)  # mean loss on removed patches
+
+        assert loss[mask==0].mean() < 0.1
+
         return loss.mean() # loss on reconstruction
 
 
