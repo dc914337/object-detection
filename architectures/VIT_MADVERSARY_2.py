@@ -4,6 +4,7 @@ from argparse import Namespace
 import torch
 from torch import nn as nn
 from torch.nn import functional as F
+import collections.abc
 
 import utils
 from architectures.slot_attention.slot_attention import Encoder, Decoder, SlotAttention
@@ -13,10 +14,127 @@ from PIL import Image as Image, ImageEnhance
 from functools import partial
 from timm.layers import PatchEmbed, Mlp, DropPath, trunc_normal_, lecun_normal_, resample_patch_embed, resample_abs_pos_embed, RmsNorm
 
-from architectures.vit.vit_mae import ViTMAEModel, ViTMAEDecoderOutput, get_2d_sincos_pos_embed, ViTMAEConfig, ViTMAEDecoder,ViTMAELayer, ViTMAEForPreTraining, ViTMAEEmbeddings, ViTMAEEncoder, ViTMAEPreTrainedModel
+from architectures.vit.vit_mae import ViTMAEDecoderOutput, get_2d_sincos_pos_embed, ViTMAEConfig, ViTMAEDecoder,ViTMAELayer, ViTMAEEncoder, ViTMAEPreTrainedModel
 from transformers import AutoImageProcessor
 import math
 from copy import deepcopy
+
+
+
+
+class ViTMAEEmbeddings(nn.Module):
+    """
+    Construct the CLS token, position and patch embeddings.
+
+    """
+
+    def __init__(self, config):
+        super().__init__()
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
+        self.pad_token = nn.Parameter(torch.zeros(1, config.hidden_size))
+
+
+        self.patch_embeddings = ViTMAEPatchEmbeddings(config)
+        self.num_patches = self.patch_embeddings.num_patches
+        # fixed sin-cos embedding
+        self.position_embeddings = nn.Parameter(
+            torch.zeros(1, self.num_patches + 1, config.hidden_size), requires_grad=False
+        )
+        self.config = config
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        # initialize (and freeze) position embeddings by sin-cos embedding
+        pos_embed = get_2d_sincos_pos_embed(
+            self.position_embeddings.shape[-1], int(self.patch_embeddings.num_patches**0.5), add_cls_token=True
+        )
+        self.position_embeddings.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+        # initialize patch_embeddings like nn.Linear (instead of nn.Conv2d)
+        w = self.patch_embeddings.projection.weight.data
+        torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+
+        # timm's trunc_normal_(std=.02) is effectively normal_(std=0.02) as cutoff is too big (2.)
+        torch.nn.init.normal_(self.cls_token, std=self.config.initializer_range)
+        torch.nn.init.normal_(self.pad_token, std=self.config.initializer_range)
+
+
+    def padded_masking(self, sequence, mask=None):
+        """
+        Perform per-sample random masking by per-sample shuffling. Per-sample shuffling is done by argsort random
+        noise.
+
+        Args:
+            sequence (`torch.LongTensor` of shape `(batch_size, sequence_length, dim)`)
+            mask (`torch.FloatTensor` of shape `(batch_size, sequence_length)`, *optional*) which is
+                mainly used for testing purposes to control randomness and maintain the reproducibility
+        """
+        batch_size, seq_length, dim = sequence.shape
+        noise_token = mask.reshape(batch_size, seq_length, 1)
+        # apply mask
+        sequence_masked = sequence * (1.-noise_token) + noise_token * self.pad_token.reshape(1, 1, dim)
+
+        return sequence_masked
+
+    def forward(self, pixel_values, mask=None):
+        """
+        Either mask_ratio or mask must be specified but not both.
+
+
+        """
+
+        batch_size, num_channels, height, width = pixel_values.shape
+        embeddings = self.patch_embeddings(pixel_values)
+
+        # add position embeddings w/o cls token
+        embeddings = embeddings + self.position_embeddings[:, 1:, :]
+
+        # masking: length -> length * mask_ratio
+        embeddings = self.padded_masking(embeddings, mask=mask)
+
+        # append cls token
+        cls_token = self.cls_token + self.position_embeddings[:, :1, :]
+        cls_tokens = cls_token.expand(embeddings.shape[0], -1, -1)
+        embeddings = torch.cat((cls_tokens, embeddings), dim=1)
+
+        return embeddings
+
+
+class ViTMAEPatchEmbeddings(nn.Module):
+    """
+    This class turns `pixel_values` of shape `(batch_size, num_channels, height, width)` into the initial
+    `hidden_states` (patch embeddings) of shape `(batch_size, seq_length, hidden_size)` to be consumed by a
+    Transformer.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        image_size, patch_size = config.image_size, config.patch_size
+        num_channels, hidden_size = config.num_channels, config.hidden_size
+        image_size = image_size if isinstance(image_size, collections.abc.Iterable) else (image_size, image_size)
+        patch_size = patch_size if isinstance(patch_size, collections.abc.Iterable) else (patch_size, patch_size)
+        num_patches = (image_size[1] // patch_size[1]) * (image_size[0] // patch_size[0])
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.num_channels = num_channels
+        self.num_patches = num_patches
+
+        self.projection = nn.Conv2d(num_channels, hidden_size, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, pixel_values):
+        batch_size, num_channels, height, width = pixel_values.shape
+        if num_channels != self.num_channels:
+            raise ValueError(
+                "Make sure that the channel dimension of the pixel values match with the one set in the configuration."
+            )
+        if height != self.image_size[0] or width != self.image_size[1]:
+            raise ValueError(
+                f"Input image size ({height}*{width}) doesn't match model ({self.image_size[0]}*{self.image_size[1]})."
+            )
+        x = self.projection(pixel_values).flatten(2).transpose(1, 2)
+        return x
+
 
 
 
@@ -59,19 +177,12 @@ class ViTMaskDecoder(nn.Module):
     def forward(
         self,
         hidden_states,
-        ids_restore,
         output_attentions=False,
         output_hidden_states=False,
         return_dict=True,
     ):
         # embed tokens
         x = self.decoder_embed(hidden_states)
-
-        # append mask tokens to sequence
-        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
-        x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)  # no cls token
-        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
-        x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token
 
         # add pos embed
         hidden_states = x + self.decoder_pos_embed
@@ -140,18 +251,19 @@ class Recon(ViTMAEPreTrainedModel):
                             list(self.vit_encoder_recon.parameters()) +
                             list(self.decoder_recon.parameters()))
 
+    def generate_random_mask(self, batch_size, random_mask_ratio):
+        num_patches = self.embeddings_recon.num_patches
+        mask = (torch.rand(batch_size, num_patches, device=self.device) <= random_mask_ratio).to(torch.float) # noise in [0, 1]
+        return mask
 
-    def forward(self, image, mask_ratio=0.75, mask_noise=None, output_attentions = False):
+    def forward(self, image, mask=None, output_attentions = False):
         B = image.shape[0]
         num_patches = self.embeddings_recon.num_patches
 
 
         head_mask = self.get_head_mask(None, self.cfg_vit.num_hidden_layers)
 
-        #full_mask = mask_noise[:,torch.randperm(144)]
-        embedding_output, mask_learned, ids_restore = self.embeddings_recon(image, mask_ratio=mask_ratio,
-                                                                      noise=mask_noise,
-                                                                      padded=True)
+        embedding_output = self.embeddings_recon(image, mask=mask)
 
         encoder_outputs = self.vit_encoder_recon(
             embedding_output,
@@ -163,10 +275,10 @@ class Recon(ViTMAEPreTrainedModel):
         sequence_output = self.layernorm_recon(sequence_output)
 
         # decoder for reconstruction
-        decoder_outputs = self.decoder_recon(sequence_output, ids_restore)
+        decoder_outputs = self.decoder_recon(sequence_output)
         logits = decoder_outputs.logits.reshape(B, num_patches, self.cfg.patch_size, self.cfg.patch_size, 3)  # shape (batch_size, num_patches, patch_size, patch_size) - mask
 
-        return logits.reshape(B, num_patches, -1), mask_learned
+        return logits.reshape(B, num_patches, -1)
     def save(self, path):
         torch.save(self.state_dict(), path)
 
@@ -188,7 +300,7 @@ class Masker(ViTMAEPreTrainedModel):
 
         # decoder for masker
         self.cfg_vit_decoder = ViTMAEConfig(**cfg.dict())
-        self.cfg_vit_decoder.num_channels = cfg.decoder_num_classes
+        self.cfg_vit_decoder.num_channels = self.cfg.decoder_num_classes
         self.decoder_mask = ViTMaskDecoder(self.cfg_vit_decoder, num_patches=self.embeddings_mask.num_patches)
 
         self.params = list(list(self.embeddings_mask.parameters()) +
@@ -197,14 +309,16 @@ class Masker(ViTMAEPreTrainedModel):
                            list(self.decoder_mask.parameters()))
 
 
-    def forward(self, image, mask_ratio=0.75, temperature=1, output_attentions=False):
+    def forward(self, image, temperature=1, output_attentions=False):
         B = image.shape[0]
         num_patches = self.embeddings_mask.num_patches
         patch_size = self.cfg.patch_size
 
         # encoder for mask
         head_mask = self.get_head_mask(None, self.cfg_vit.num_hidden_layers)
-        embedding_output, mask_random, ids_restore = self.embeddings_mask(image, mask_ratio=0)  # inputting unmasked image
+
+        empty_mask = torch.zeros((B, num_patches), device=image.device, dtype=torch.float)
+        embedding_output = self.embeddings_mask(image, mask=empty_mask)  # inputting unmasked image
 
         encoder_outputs = self.vit_encoder_mask(
             embedding_output,
@@ -216,10 +330,9 @@ class Masker(ViTMAEPreTrainedModel):
         sequence_output = self.layernorm_mask(sequence_output)
 
         # decoder for mask
-        decoder_outputs = self.decoder_mask(sequence_output,
-                                            ids_restore)  # shape (batch_size, num_patches, patch_size**2 * channels)
+        decoder_outputs = self.decoder_mask(sequence_output)  # shape (batch_size, num_patches, patch_size**2 * channels)
         patch_logits = decoder_outputs.logits.reshape(B, num_patches,
-                                                      4)  # shape (batch_size, num_patches, patch_size^2, 2)
+                                                      self.cfg.decoder_num_classes)  # shape (batch_size, num_patches, patch_size^2, 2)
         patch_mask_probs = F.gumbel_softmax(patch_logits, tau=temperature, hard=True,
                                             dim=-1)  # shape (batch_size, num_patches, patch_size, patch_size)
         return patch_mask_probs[:, :, :], patch_logits[:, :, :]
@@ -228,7 +341,19 @@ class Masker(ViTMAEPreTrainedModel):
         torch.save(self.state_dict(), path)
 
     def load(self, path):
-        missing_keys, unexpected_keys = self.load_state_dict(torch.load(path), strict=False)
+        # update all the keys in the state dict from recon to mask
+        state_dict = torch.load(path)
+        for key in list(state_dict.keys()):
+            if 'decoder_pred' in key:
+                state_dict.pop(key)
+                continue # don't need these keys because
+
+            if 'recon' in key:
+                state_dict[key.replace('recon', 'mask')] = state_dict.pop(key)
+
+
+
+        missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=False)
         print("missing keys: ", missing_keys)
         print("unexpected keys: ", unexpected_keys)
 
@@ -359,8 +484,15 @@ class VIT_MADVERSARY_2(nn.Module):
         if cfg.masker_mae.pretrained_path is not None:
             self.masker.load(cfg.masker_mae.pretrained_path)
 
-        for param in self.reconstructor.parameters():
-            param.requires_grad = False
+
+        # freeze masker and recon
+        #for param in list(self.reconstructor.parameters()) + \
+        #             list(self.masker.vit_encoder_mask.parameters()) + \
+        #             list(self.masker.embeddings_mask.parameters()) + \
+        #             list(self.masker.layernorm_mask.parameters()):
+        #    param.requires_grad = False
+
+
 
     def forward_loss(self, pixel_values, pred, mask):
         """
@@ -382,68 +514,87 @@ class VIT_MADVERSARY_2(nn.Module):
             target = (target - mean) / (var + 1.0e-6) ** 0.5
 
         loss = (pred - target) ** 2
-        loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
+        loss = loss.mean(dim=1)  # [N, L], mean loss per patch
 
-        nonzero_mask = (mask.sum(dim=1) != 0.) # some of the items may be zero
-        if not nonzero_mask.any():
-            return 0.  # if all masks are empty - we can't calculate the loss
+        #nonzero_mask = (mask.sum(dim=1) != 0.) # some of the items may be zero
+        #if not nonzero_mask.any():
+        #    return 0.  # if all masks are empty - we can't calculate the loss
         #loss = (loss * mask)[nonzero_mask].mean()   #/ mask[nonzero_mask].sum(dim=1)  # mean loss on removed patches
 
-        assert loss[mask==0].mean() < 0.1
+        #assert loss[mask==0].max() < 0.1
 
         return loss.mean() # loss on reconstruction
 
-
-    def forward(self, image, mask_ratio=0.75, temperature=1., train_recon = False):
-        B, C, H, W = image.shape
+    def forward(self, image, mask_ratio=0.75, temperature=1., train_recon=False):
         if train_recon:
-            image_logits, mask_learned = self.reconstructor(image, mask_ratio=mask_ratio, mask_noise=None)
-            loss_masked_recon = self.forward_loss(image, image_logits, mask_learned)
-            mask_prob = mask_learned
-            mask_logits = mask_prob
-            losses_masked_recon = [loss_masked_recon]*4
-            losses_mask = 0.
-
-            # hack
-            image_logits = image_logits.reshape(B, 144, 27, 1).expand(-1, -1, -1, 3)
-            mask_learned = mask_learned.reshape(B, 144, 1).expand(-1, -1, 4)
-            mask_logits = mask_logits.reshape(B, 144, 1).expand(-1, -1, 4)
+            return self.forward_recon(image, mask_ratio=mask_ratio)
         else:
-            mask_prob, mask_logits = self.masker(image, mask_ratio=mask_ratio, temperature=temperature)
+            return self.forward_masker(image, mask_ratio=mask_ratio, temperature=temperature)
 
-            image_logits_list = []
-            mask_learned_list = []
-            loss_masked_recon = 0.
-            losses_masked_recon = []
-            losses_mask = 0.
-            for i in range(1, 4):
-                image_logits, mask_learned = self.reconstructor(image, mask_ratio=mask_ratio, mask_noise = mask_prob[:, :, i])
+    def forward_recon(self, image, mask_ratio=0.75):
+        B, C, H, W = image.shape
 
-                loss_masked_recon_ = self.forward_loss(image, image_logits, mask_prob[:, :, i])
-                loss_masked_recon += loss_masked_recon_
-                losses_masked_recon.append(loss_masked_recon_)
-                image_logits_list.append(image_logits.detach())
-                mask_learned_list.append(mask_learned)
+        mask = self.reconstructor.generate_random_mask(B, mask_ratio)
+        image_logits = self.reconstructor(image, mask=mask)
+        loss_masked_recon = self.forward_loss(image, image_logits, mask)
 
-                patch_means = mask_prob[:, :, i].mean(dim=1)
-                losses_mask += ((patch_means - mask_ratio) ** 2).mean()
-
-            image_logits = torch.stack(image_logits_list, dim=3)
-            mask_learned = torch.stack(mask_learned_list, dim=2)
-
-
+        # hack
+        #image_logits = image_logits.reshape(B, 144, 27, 1).expand(-1, -1, -1, 3)
+        mask_learned = mask.reshape(B, 144, 1).expand(-1, -1, 4)
+        #mask_logits = mask_logits.reshape(B, 144, 1).expand(-1, -1, 4)
+        mask_prob = mask
 
         return {
-                "loss_masked_recon": loss_masked_recon,
-                "losses_masked_recon": losses_masked_recon,
-                "loss_mask": losses_mask,
-                "loss_recon_1": losses_masked_recon[0],
-                "loss_recon_2": losses_masked_recon[1],
-                "loss_recon_3": losses_masked_recon[2],
-                "logits_masked_img": image_logits,
-                "mask_learned": mask_learned,
+            "image_logits": image_logits,
+            "mask": mask,
+            "loss_recon": loss_masked_recon,
+        }
+
+    def forward_masker(self, image, mask_ratio=0.75, temperature=1.):
+        mask_prob, mask_logits = self.masker(image, temperature=temperature)
+        num_classes = mask_prob.shape[-1]
+
+        image_logits_list = []
+        mask_learned_list = []
+        loss_masks = []
+        loss_recons = []
+        loss_masked_recon = 0.
+        losses_mask = 0.
+
+        res_dict = {}
+
+        for i in range(1, num_classes):
+            learned_mask = mask_prob[:, :, i]
+
+            image_logits = self.reconstructor(image, mask = learned_mask)
+
+            loss_masked_recon_ = self.forward_loss(image, image_logits, learned_mask)
+            loss_masked_recon += loss_masked_recon_
+            image_logits_list.append(image_logits.detach())
+            mask_learned_list.append(learned_mask.detach())
+
+            patch_means = mask_prob[:, :, i].mean(dim=1)
+            mask_loss = ((patch_means - mask_ratio) ** 2).mean()
+
+            losses_mask += mask_loss
+            loss_masks.append(mask_loss.detach().item())
+            loss_recons.append(loss_masked_recon_.detach().item())
+
+        res_dict.update(
+            {
                 "mask_logits": mask_logits,
-                "mask_prob": mask_prob}
+                "mask": mask_prob,
+                "mask_real": mask_learned_list,
+
+                "logits_masked_img": image_logits_list,
+                "loss_masked_recon": loss_masked_recon,
+                "loss_mask": losses_mask,
+
+                "loss_recons": loss_recons,
+                "loss_masks": loss_masks,
+            }
+        )
+        return res_dict
 
 
 
@@ -492,16 +643,14 @@ class VIT_MADVERSARY_2(nn.Module):
 
         image = image.permute(0, 2, 3, 1)
         log_dict["mask_ratio"] = mask_ratio
-        log_dict["loss_mask"] = loss_mask
+        log_dict["loss_mask"] = loss_mask.item()
         log_dict["loss_masked_recon"] = loss_masked_recon
-        log_dict["loss_recon_1"] = res["loss_recon_1"]
-        log_dict["loss_recon_2"] = res["loss_recon_2"]
-        log_dict["loss_recon_3"] = res["loss_recon_3"]
-
+        for i in range(len(res["loss_recons"])):
+            log_dict[f"loss_recon_{i}"] = res["loss_recons"][i]
+            log_dict[f"loss_mask_{i}"] = res["loss_masks"][i]
 
         log_dict["train_mask"] = not train_recon
         log_dict["temperature"] = temperature
-
 
 
         if visualize:
@@ -516,9 +665,7 @@ class VIT_MADVERSARY_2(nn.Module):
         else:
             loss = -loss_masked_recon + loss_mask
             self.optimizer_masker.zero_grad()
-            a=True
-            if a:
-                loss.backward()
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(self.masker.params, 1e-4)
             self.optimizer_masker.step()
 
@@ -541,8 +688,10 @@ class VIT_MADVERSARY_2(nn.Module):
         batch_size = min(image.shape[0], max_rows)
         image = image[:batch_size]
         recons_masked_imgs = []
-        for i in range(res_dict["logits_masked_img"].shape[3]):
-            logits_masked_img = res_dict["logits_masked_img"][:batch_size, :, :, i]
+        num_recons = len(res_dict["logits_masked_img"])
+
+        for i in range(num_recons):
+            logits_masked_img = res_dict["logits_masked_img"][i][:batch_size, :, :]
             recons_masked = reconstruct_image_from_logits(logits_masked_img,
                                                           patch_size = self.cfg.patch_size,
                                                           img_size = self.cfg.image_size,
@@ -550,10 +699,15 @@ class VIT_MADVERSARY_2(nn.Module):
             recons_masked = normalize(recons_masked.cpu().detach().numpy())  # B, H, W, C
             recons_masked_imgs.append(recons_masked)
 
-        masks_learned = res_dict["mask_learned"][:batch_size]
+        masks_learned = res_dict["mask"][:batch_size]
 
 
-        titles = ["image", "mask logits 1", "masked 1", "recon 1", "mask logits 2", "masked 2", "recon 2", "mask logits 3","masked 3", "recon 3"]
+        titles = ["image"]
+        for i in range(num_recons):
+            titles.append(f"mask logits {i+1}")
+            titles.append(f"masked {i+1}")
+            titles.append(f"recon {i+1}")
+
         fig, ax = plt.subplots(batch_size, len(titles), figsize=(20, 9))
 
         patch_size = self.cfg.patch_size
@@ -562,7 +716,7 @@ class VIT_MADVERSARY_2(nn.Module):
 
         image = normalize(image.cpu().detach().numpy())  # B, H, W, C
 
-        mask_prob = normalize(res_dict["mask_prob"].cpu().detach().numpy())  # B, H, W, C
+        mask_prob = normalize(res_dict["mask"].cpu().detach().numpy())  # B, H, W, C
         mask_logits = normalize(res_dict["mask_logits"].cpu().detach().numpy())  # B, H, W, C
 
         #masked_input_learned = (1-mask_learned) * image
@@ -577,25 +731,29 @@ class VIT_MADVERSARY_2(nn.Module):
 
 
             for i in range(len(recons_masked_imgs)):
-                ax[batch_id, i*3+1].imshow(mask_logits[batch_id, :, i+1].reshape(patches_num, patches_num), vmin=0, vmax=1)
-                ax[batch_id, i*3+1].grid(False)
-                ax[batch_id, i*3+1].axis('off')
+                # mask logits
+                ax[batch_id, i*num_recons+1].imshow(mask_logits[batch_id, :, i+1].reshape(patches_num, patches_num), vmin=0, vmax=1)
+                ax[batch_id, i*num_recons+1].grid(False)
+                ax[batch_id, i*num_recons+1].axis('off')
 
+                RGB_CHANNELS = 3
                 mask_learned = F.interpolate(
-                    masks_learned[:,:,i].detach().cpu().expand(3, -1, -1).reshape(-1, batch_size, patches_num,
+                    masks_learned[:,:,i+1].detach().cpu().expand(RGB_CHANNELS, -1, -1).reshape(-1, batch_size, patches_num,
                                                                           patches_num).permute(1, 0, 2, 3),
                     (img_size, img_size)).permute(0, 2, 3, 1)  # B, H, W, C
 
                 masked_input_learned = (1 - mask_learned) * image
 
 
-                ax[batch_id, i*3+2].imshow(masked_input_learned[batch_id] + mask_learned[batch_id])
-                ax[batch_id, i*3+2].grid(False)
-                ax[batch_id, i*3+2].axis('off')
+                # masked
+                ax[batch_id, i*num_recons+2].imshow(masked_input_learned[batch_id] + mask_learned[batch_id])
+                ax[batch_id, i*num_recons+2].grid(False)
+                ax[batch_id, i*num_recons+2].axis('off')
 
-                ax[batch_id, i*3+3].imshow(masked_input_learned[batch_id] + mask_learned[batch_id]*recons_masked_imgs[i][batch_id])
-                ax[batch_id, i*3+3].grid(False)
-                ax[batch_id, i*3+3].axis('off')
+                # recon
+                ax[batch_id, i*num_recons+3].imshow(recons_masked_imgs[i][batch_id])
+                ax[batch_id, i*num_recons+3].grid(False)
+                ax[batch_id, i*num_recons+3].axis('off')
 
 
 

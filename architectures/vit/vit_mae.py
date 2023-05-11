@@ -196,166 +196,6 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     return emb
 
 
-class ViTMAEEmbeddings(nn.Module):
-    """
-    Construct the CLS token, position and patch embeddings.
-
-    """
-
-    def __init__(self, config):
-        super().__init__()
-
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
-        self.pad_token = nn.Parameter(torch.zeros(1, config.hidden_size))
-
-
-        self.patch_embeddings = ViTMAEPatchEmbeddings(config)
-        self.num_patches = self.patch_embeddings.num_patches
-        # fixed sin-cos embedding
-        self.position_embeddings = nn.Parameter(
-            torch.zeros(1, self.num_patches + 1, config.hidden_size), requires_grad=False
-        )
-        self.config = config
-        self.initialize_weights()
-
-    def initialize_weights(self):
-        # initialize (and freeze) position embeddings by sin-cos embedding
-        pos_embed = get_2d_sincos_pos_embed(
-            self.position_embeddings.shape[-1], int(self.patch_embeddings.num_patches**0.5), add_cls_token=True
-        )
-        self.position_embeddings.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-
-        # initialize patch_embeddings like nn.Linear (instead of nn.Conv2d)
-        w = self.patch_embeddings.projection.weight.data
-        torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-
-        # timm's trunc_normal_(std=.02) is effectively normal_(std=0.02) as cutoff is too big (2.)
-        torch.nn.init.normal_(self.cls_token, std=self.config.initializer_range)
-        torch.nn.init.normal_(self.pad_token, std=self.config.initializer_range)
-
-    def random_masking(self, sequence, random_mask_ratio, noise=None):
-        """
-        Perform per-sample random masking by per-sample shuffling. Per-sample shuffling is done by argsort random
-        noise.
-
-        Args:
-            sequence (`torch.LongTensor` of shape `(batch_size, sequence_length, dim)`)
-            noise (`torch.FloatTensor` of shape `(batch_size, sequence_length)`, *optional*) which is
-                mainly used for testing purposes to control randomness and maintain the reproducibility
-        """
-        batch_size, seq_length, dim = sequence.shape
-        len_keep = int(seq_length * (1 - random_mask_ratio))
-
-        if noise is None:
-            noise = torch.rand(batch_size, seq_length, device=sequence.device)  # noise in [0, 1]
-
-        # sort noise for each sample
-        ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
-        ids_restore = torch.argsort(ids_shuffle, dim=1)
-
-        # keep the first subset
-        ids_keep = ids_shuffle[:, :len_keep]
-        sequence_unmasked = torch.gather(sequence, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, dim))
-
-        # generate the binary mask: 0 is keep, 1 is remove
-        mask = torch.ones([batch_size, seq_length], device=sequence.device)
-        mask[:, :len_keep] = 0
-        # unshuffle to get the binary mask
-        mask = torch.gather(mask, dim=1, index=ids_restore)
-
-        return sequence_unmasked, mask, ids_restore
-
-
-    def padded_masking(self, sequence, random_mask_ratio, noise):
-        """
-        Perform per-sample random masking by per-sample shuffling. Per-sample shuffling is done by argsort random
-        noise.
-
-        Args:
-            sequence (`torch.LongTensor` of shape `(batch_size, sequence_length, dim)`)
-            noise (`torch.FloatTensor` of shape `(batch_size, sequence_length)`, *optional*) which is
-                mainly used for testing purposes to control randomness and maintain the reproducibility
-        """
-        batch_size, seq_length, dim = sequence.shape
-        len_keep = int(seq_length)
-        if noise is None:
-            noise = (torch.rand(batch_size, seq_length, device=sequence.device) <= random_mask_ratio).to(torch.float)  # noise in [0, 1]
-
-        noise_token = noise.reshape(batch_size, seq_length, 1)
-        # apply mask
-        sequence_masked = sequence * (1.-noise_token) + noise_token * self.pad_token.reshape(1, 1, dim)
-
-        # sort noise for each sample
-        ids_restore = torch.arange(0, seq_length, device=sequence.device).repeat(batch_size, 1)
-        sequence_unmasked = torch.gather(sequence_masked, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, dim))
-
-        # generate the binary mask: 0 is keep, 1 is remove
-        #mask = torch.ones([batch_size, seq_length], device=sequence_masked.device)
-        #mask[:, :len_keep] = 0
-        # unshuffle to get the binary mask
-        #mask = torch.gather(mask, dim=1, index=ids_restore)
-
-        return sequence_unmasked, noise, ids_restore
-
-
-
-
-    def forward(self, pixel_values, mask_ratio=0., noise=None, padded = False):
-        batch_size, num_channels, height, width = pixel_values.shape
-        embeddings = self.patch_embeddings(pixel_values)
-
-        # add position embeddings w/o cls token
-        embeddings = embeddings + self.position_embeddings[:, 1:, :]
-
-        # masking: length -> length * mask_ratio
-        if padded:
-            embeddings, mask, ids_restore = self.padded_masking(embeddings, random_mask_ratio=mask_ratio, noise=noise)
-        else:
-            embeddings, mask, ids_restore = self.random_masking(embeddings, random_mask_ratio=mask_ratio, noise=noise)
-
-        # append cls token
-        cls_token = self.cls_token + self.position_embeddings[:, :1, :]
-        cls_tokens = cls_token.expand(embeddings.shape[0], -1, -1)
-        embeddings = torch.cat((cls_tokens, embeddings), dim=1)
-
-        return embeddings, mask, ids_restore
-
-
-class ViTMAEPatchEmbeddings(nn.Module):
-    """
-    This class turns `pixel_values` of shape `(batch_size, num_channels, height, width)` into the initial
-    `hidden_states` (patch embeddings) of shape `(batch_size, seq_length, hidden_size)` to be consumed by a
-    Transformer.
-    """
-
-    def __init__(self, config):
-        super().__init__()
-        image_size, patch_size = config.image_size, config.patch_size
-        num_channels, hidden_size = config.num_channels, config.hidden_size
-        image_size = image_size if isinstance(image_size, collections.abc.Iterable) else (image_size, image_size)
-        patch_size = patch_size if isinstance(patch_size, collections.abc.Iterable) else (patch_size, patch_size)
-        num_patches = (image_size[1] // patch_size[1]) * (image_size[0] // patch_size[0])
-        self.image_size = image_size
-        self.patch_size = patch_size
-        self.num_channels = num_channels
-        self.num_patches = num_patches
-
-        self.projection = nn.Conv2d(num_channels, hidden_size, kernel_size=patch_size, stride=patch_size)
-
-    def forward(self, pixel_values):
-        batch_size, num_channels, height, width = pixel_values.shape
-        if num_channels != self.num_channels:
-            raise ValueError(
-                "Make sure that the channel dimension of the pixel values match with the one set in the configuration."
-            )
-        if height != self.image_size[0] or width != self.image_size[1]:
-            raise ValueError(
-                f"Input image size ({height}*{width}) doesn't match model ({self.image_size[0]}*{self.image_size[1]})."
-            )
-        x = self.projection(pixel_values).flatten(2).transpose(1, 2)
-        return x
-
-
 # Copied from transformers.models.vit.modeling_vit.ViTSelfAttention ViT->ViTMAE
 class ViTMAESelfAttention(nn.Module):
     def __init__(self, config: ViTMAEConfig) -> None:
@@ -810,19 +650,12 @@ class ViTMAEDecoder(nn.Module):
     def forward(
         self,
         hidden_states,
-        ids_restore,
         output_attentions=False,
         output_hidden_states=False,
         return_dict=True,
     ):
         # embed tokens
         x = self.decoder_embed(hidden_states)
-
-        # append mask tokens to sequence
-        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
-        x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)  # no cls token
-        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
-        x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token
 
         # add pos embed
         hidden_states = x + self.decoder_pos_embed
