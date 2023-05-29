@@ -3,13 +3,16 @@ resolution: &resolution 36
 patch_size: &patch_size 3
 num_classes: &num_classes 4
 
-VIT_MADVERSARY_2:
+
+model_class:  VIT_MADVERSARY_2
+
+model:
   image_size: *resolution
   patch_size: *patch_size
   num_classes: *num_classes
 
   # masker
-  masker_mae:
+  masker:
     image_size: *resolution
     patch_size: *patch_size
 
@@ -25,13 +28,14 @@ VIT_MADVERSARY_2:
     decoder_hidden_size: 128
 
     # custom parameter
-    decoder_num_classes: 2
+    decoder_num_classes: 4
 
     pretrained_path: null
-    #pretrained_path: "./checkpoints/whole tiny recon/recon_madversary_2_38000.pt"
+    #pretrained_path: "./checkpoints/whole recon both/masker_madversary_2_294000.pt"
+    #pretrained_path: "./checkpoints/softmax masker/masker_madversary_2_2000.pt"
 
   # reconstructor
-  reconstructor_mae:
+  reconstructor:
     image_size: *resolution
     patch_size: *patch_size
 
@@ -46,27 +50,32 @@ VIT_MADVERSARY_2:
     decoder_num_attention_heads: 4
     decoder_hidden_size: 128
 
-    #pretrained_path: null
+    pretrained_path: null
+    #pretrained_path: "./checkpoints/whole recon both/recon_madversary_2_222000.pt"
+    #pretrained_path: "./checkpoints/softmax recon/recon_madversary_2_1000.pt"
     #pretrained_path: "./checkpoints/tiny recon/recon_madversary_2_10000.pt"
     #pretrained_path: "./checkpoints/tiny recon/recon_madversary_2_25000.pt"
     #pretrained_path: "./checkpoints/tiny recon/recon_madversary_2_35000.pt"
-    pretrained_path: "./checkpoints/whole tiny recon/recon_madversary_2_38000.pt"
+    #pretrained_path: "./checkpoints/whole tiny recon/recon_madversary_2_38000.pt"
+    #pretrained_path: "./checkpoints/recon_madversary_2_11000.pt"
 
 
-  object_size: 0.2 #0.5 #0.18
+  object_size: 0.08 #0.5 #0.18
   temperature: 0.05
-  lr: 1.e-5
-  warmup_steps: 200
-  decay_rate: 0.5
-  decay_steps: 50000
+  lr: 1.e-3
+  warmup_steps: 1000
+  decay_rate: 0.7
+  decay_steps: 6000
   norm_pix_loss: False
 
 # training
+total_iter: 300000
 visualize_freq: 300
-eval_freq: 2500
+eval_epoch_freq: 1
 dataset_path: "data/EMORL/tetrominoes.h5"
+test_dataset_path: "data/EMORL/tetrominoes_test.h5"
 batch_size: 90
 DEBUG: False
 
-notes: "Training small masker with small reconstructor"
-train_recon: False
+notes: "Train adversarial from scratch"
+train_recon: True

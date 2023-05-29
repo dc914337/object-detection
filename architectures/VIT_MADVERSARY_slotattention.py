@@ -7,7 +7,7 @@ from torch.nn import functional as F
 import collections.abc
 
 import utils
-from architectures.slot_attention.slot_attention import Encoder, Decoder, SlotAttention
+from architectures.slot_attention.slot_attention import Encoder, Decoder, SlotAttention, SoftPositionEmbed
 from utils import normalize
 import matplotlib.pyplot as plt
 from PIL import Image as Image, ImageEnhance
@@ -18,7 +18,8 @@ from architectures.vit.vit_mae import ViTMAEDecoderOutput, get_2d_sincos_pos_emb
 from transformers import AutoImageProcessor
 import math
 from copy import deepcopy
-import wandb
+
+import numpy as np
 
 
 
@@ -253,9 +254,8 @@ class Recon(ViTMAEPreTrainedModel):
 
     def generate_random_mask(self, batch_size, random_mask_ratio):
         num_patches = self.embeddings_recon.num_patches
-        mask = (torch.rand(batch_size, num_patches, device=self.device)).to(torch.float) # noise in [0, 1]
-
-        return torch.sigmoid(mask)
+        mask = (torch.rand(batch_size, num_patches, device=self.device) <= random_mask_ratio).to(torch.float) # noise in [0, 1]
+        return mask
 
     def forward(self, image, mask=None, output_attentions = False):
         B = image.shape[0]
@@ -289,55 +289,77 @@ class Recon(ViTMAEPreTrainedModel):
         print("unexpected keys: ", unexpected_keys)
 
 
-class Masker(ViTMAEPreTrainedModel):
-    def __init__(self, cfg):
+class Masker(nn.Module):
+    def __init__(self, cfg, device):
         self.cfg = cfg
-        self.cfg_vit = ViTMAEConfig(**cfg.dict())
-        super(Masker, self).__init__(self.cfg_vit)
+        self.device = device
+        super(Masker, self).__init__()
 
-        self.embeddings_mask = ViTMAEEmbeddings(self.cfg_vit)
-        self.layernorm_mask = nn.LayerNorm(self.cfg_vit.hidden_size, eps=self.cfg_vit.layer_norm_eps)
-        self.vit_encoder_mask = ViTMAEEncoder(self.cfg_vit)
+        self.encoder_cnn = Encoder((cfg.image_size, cfg.image_size), cfg.hidden_size)
 
-        # decoder for masker
-        self.cfg_vit_decoder = ViTMAEConfig(**cfg.dict())
-        self.cfg_vit_decoder.num_channels = self.cfg.decoder_num_classes
-        self.decoder_mask = ViTMaskDecoder(self.cfg_vit_decoder, num_patches=self.embeddings_mask.num_patches)
+        self.fc1 = nn.Linear(cfg.hidden_size, cfg.hidden_size)
+        self.fc2 = nn.Linear(cfg.hidden_size, cfg.hidden_size)
 
-        self.params = list(list(self.embeddings_mask.parameters()) +
-                           list(self.layernorm_mask.parameters()) +
-                           list(self.vit_encoder_mask.parameters()) +
-                           list(self.decoder_mask.parameters()))
+        self.slot_attention = SlotAttention(
+            num_slots=cfg.decoder_num_classes,
+            dim=cfg.hidden_size,
+            iters=3,
+            eps=1e-8,
+            hidden_dim=cfg.hidden_size)
+
+        self.decoder_cnn = Decoder(cfg.hidden_size, (cfg.image_size, cfg.image_size))
+
+
+
+        self.params = list(list(self.encoder_cnn.parameters()) +
+                           list(self.fc1.parameters()) +
+                           list(self.fc2.parameters()) +
+                           list(self.slot_attention.parameters()) +
+                           list(self.decoder_cnn.parameters()))
 
 
     def forward(self, image, temperature=1, output_attentions=False):
         B = image.shape[0]
-        num_patches = self.embeddings_mask.num_patches
         patch_size = self.cfg.patch_size
+        num_patches = 144
+        # Convolutional encoder with position embedding.
+        x = self.encoder_cnn(image)  # CNN Backbone.
+        #x = nn.LayerNorm(x.shape[1:]).to(self.device)(x)
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.fc2(x)  # Feedforward network on set.
+        # `x` has shape: [batch_size, width*height, input_size].
 
-        # encoder for mask
-        head_mask = self.get_head_mask(None, self.cfg_vit.num_hidden_layers)
+        # Slot Attention module.
+        slots = self.slot_attention(x)
+        # `slots` has shape: [batch_size, num_slots, slot_size].
 
-        empty_mask = torch.zeros((B, num_patches), device=image.device, dtype=torch.float)
-        embedding_output = self.embeddings_mask(image, mask=empty_mask)  # inputting unmasked image
+        # """Broadcast slot features to a 2D grid and collapse slot dimension.""".
+        slots = slots.reshape((-1, slots.shape[-1])).unsqueeze(1).unsqueeze(2)
+        slots = slots.repeat((1, 8, 8, 1))
 
-        encoder_outputs = self.vit_encoder_mask(
-            embedding_output,
-            head_mask=head_mask,
-            output_attentions=output_attentions,
-            output_hidden_states=False
-        )
-        sequence_output = encoder_outputs[0]
-        sequence_output = self.layernorm_mask(sequence_output)
+        # `slots` has shape: [batch_size*num_slots, width_init, height_init, slot_size].
+        x = self.decoder_cnn(slots)
+        # `x` has shape: [batch_size*num_slots, width, height, num_channels+1].
 
-        # decoder for mask
-        decoder_outputs = self.decoder_mask(sequence_output)  # shape (batch_size, num_patches, patch_size**2 * channels)
-        patch_logits = decoder_outputs.logits.reshape(B, num_patches,
-                                                      self.cfg.decoder_num_classes)  # shape (batch_size, num_patches, patch_size^2, 2)
+        # Undo combination of slot and batch dimension; split alpha masks.
+        recons, masks = x.reshape(image.shape[0], -1, x.shape[1], x.shape[2], x.shape[3]).split([3, 1], dim=-1)
+        # `recons` has shape: [batch_size, num_slots, width, height, num_channels].
+        # `masks` has shape: [batch_size, num_slots, width, height, 1].
 
-        patch_mask_probs = F.softmax(patch_logits, dim=-1)
-        #patch_mask_probs = F.gumbel_softmax(patch_logits, tau=temperature, hard=True,  dim=-1)  # shape (batch_size, num_patches, patch_size, patch_size)
-        return patch_mask_probs[:, :, :], patch_logits[:, :, :]
+        # Normalize alpha masks over slots.
+        #masks = nn.Softmax(dim=1)(masks).squeeze()
+
+        masks = masks.squeeze()
+        patch_logits = F.gumbel_softmax(masks, tau=temperature, hard=True, dim=1)
+        patch_mask_probs = F.max_pool2d(patch_logits, kernel_size=3, stride=3).permute(0,2,3,1).reshape(B, num_patches, self.cfg.decoder_num_classes)  # convert to patches
+
+        #recon_combined = torch.sum(recons * masks, dim=1)  # Recombine image.
+        #recon_combined = recon_combined.permute(0, 3, 1, 2)
+        # `recon_combined` has shape: [batch_size, width, height, num_channels].
+
+
+        return patch_mask_probs[:, :, :], patch_mask_probs[:, :, :]
 
     def save(self, path):
         torch.save(self.state_dict(), path)
@@ -419,7 +441,7 @@ def patchify(pixel_values, patch_size, num_channels):
 
 
 
-class VIT_MADVERSARY_2(nn.Module):
+class VIT_MADVERSARY_slotattention(nn.Module):
     """Slot Attention-based auto-encoder for object discovery."""
 
     @classmethod
@@ -472,7 +494,7 @@ class VIT_MADVERSARY_2(nn.Module):
         self.device = device
 
         # masker 2
-        self.masker = Masker(cfg.masker)
+        self.masker = Masker(cfg.masker, device)
         self.optimizer_masker = torch.optim.Adam(self.masker.params, lr=cfg.lr)
 
         # reconstructor
@@ -516,8 +538,7 @@ class VIT_MADVERSARY_2(nn.Module):
             target = (target - mean) / (var + 1.0e-6) ** 0.5
 
         loss = (pred - target) ** 2
-        loss_patch = loss.mean(dim=1)  # [N, L], mean loss per patch
-        loss_whole = loss.sum(dim=[1,2]) / 100
+        loss = loss.mean(dim=1)  # [N, L], mean loss per patch
 
         #nonzero_mask = (mask.sum(dim=1) != 0.) # some of the items may be zero
         #if not nonzero_mask.any():
@@ -526,7 +547,7 @@ class VIT_MADVERSARY_2(nn.Module):
 
         #assert loss[mask==0].max() < 0.1
 
-        return loss_patch.mean(), loss_whole.mean()  # loss on reconstruction
+        return loss.mean() # loss on reconstruction
 
     def forward(self, image, mask_ratio=0.75, temperature=1., train_recon=False):
         if train_recon:
@@ -537,16 +558,20 @@ class VIT_MADVERSARY_2(nn.Module):
     def forward_recon(self, image, mask_ratio=0.75):
         B, C, H, W = image.shape
 
-        #mask_ = self.reconstructor.generate_random_mask(B, mask_ratio)
-        mask, mask_logits = self.masker(image, temperature=0)
-        mask = mask.detach()[:,:,1]
+        mask = self.reconstructor.generate_random_mask(B, mask_ratio)
         image_logits = self.reconstructor(image, mask=mask)
-        loss_patch, loss_whole = self.forward_loss(image, image_logits, mask)
+        loss_masked_recon = self.forward_loss(image, image_logits, mask)
+
+        # hack
+        #image_logits = image_logits.reshape(B, 144, 27, 1).expand(-1, -1, -1, 3)
+        mask_learned = mask.reshape(B, 144, 1).expand(-1, -1, 4)
+        #mask_logits = mask_logits.reshape(B, 144, 1).expand(-1, -1, 4)
+        mask_prob = mask
 
         return {
             "image_logits": image_logits,
             "mask": mask,
-            "loss_recon": loss_patch,
+            "loss_recon": loss_masked_recon,
         }
 
     def forward_masker(self, image, mask_ratio=0.75, temperature=1.):
@@ -556,8 +581,7 @@ class VIT_MADVERSARY_2(nn.Module):
         image_logits_list = []
         mask_learned_list = []
         loss_masks = []
-        loss_patch_recons = []
-        loss_whole_recons = []
+        loss_recons = []
         loss_masked_recon = 0.
         losses_mask = 0.
 
@@ -568,9 +592,8 @@ class VIT_MADVERSARY_2(nn.Module):
 
             image_logits = self.reconstructor(image, mask = learned_mask)
 
-            loss_patch, loss_whole = self.forward_loss(image, image_logits, learned_mask)
-            loss_masked_recon += loss_patch
-
+            loss_masked_recon_ = self.forward_loss(image, image_logits, learned_mask)
+            loss_masked_recon += loss_masked_recon_
             image_logits_list.append(image_logits.detach())
             mask_learned_list.append(learned_mask.detach())
 
@@ -579,21 +602,19 @@ class VIT_MADVERSARY_2(nn.Module):
 
             losses_mask += mask_loss
             loss_masks.append(mask_loss.detach().item())
-            loss_patch_recons.append(loss_patch.detach().item())
-            loss_whole_recons.append(loss_whole.detach().item())
+            loss_recons.append(loss_masked_recon_.detach().item())
 
         res_dict.update(
             {
-                "mask_logits": mask_prob,
+                "mask_logits": mask_logits,
                 "mask": mask_prob,
                 "mask_real": mask_learned_list,
 
                 "logits_masked_img": image_logits_list,
-                "loss_recon": loss_masked_recon,
+                "loss_masked_recon": loss_masked_recon,
                 "loss_mask": losses_mask,
 
-                "loss_whole_recons": loss_whole_recons,
-                "loss_patch_recons": loss_patch_recons,
+                "loss_recons": loss_recons,
                 "loss_masks": loss_masks,
             }
         )
@@ -601,17 +622,14 @@ class VIT_MADVERSARY_2(nn.Module):
 
 
 
-    def train_step(self, sample, iteration, total_iter, log_dict, train_recon=False, visualize=False):
+    def train_step(self, sample, iteration, total_iter, train_recon=False, visualize=False):
 
-        if iteration % 1000 == 0:
-            if train_recon:
-                self.reconstructor.save(f"./checkpoints/recon_madversary_2_{iteration}.pt")
-                #wandb.save(f"./checkpoints/recon_madversary_2_{iteration}.pt")
-            else:
-                self.masker.save(f"./checkpoints/masker_madversary_2_{iteration}.pt")
-                #wandb.save(f"./checkpoints/masker_madversary_2_{iteration}.pt")
+        if iteration % 1000 == 0 and train_recon:
+            self.reconstructor.save(f"./checkpoints/recon_madversary_2_{iteration}.pt")
+
 
         self.train()
+        log_dict = {}
 
         # scheduling
         if iteration < self.cfg.warmup_steps:
@@ -622,11 +640,10 @@ class VIT_MADVERSARY_2(nn.Module):
         #mask_ratio = min((iteration / 15000)+0.15, 0.75)
         #mask_ratio = max(1-(iteration / 15000)-0.1, 0.18)
         #mask_ratio = random.uniform(0.15, 0.85)
-
-        #if train_recon:
-        #    mask_ratio = random.uniform(0.07, 0.95)
-        #else:
-        mask_ratio = self.cfg.object_size # one object
+        if train_recon:
+            mask_ratio = random.uniform(0.15, 0.85)
+        else:
+            mask_ratio = self.cfg.object_size # one object
 
         #temperature = max(0.1-(iteration/10000*0.1), 0.0001)
         temperature = self.cfg.temperature #max(0.1-(iteration/10000*0.1), 0.03)
@@ -644,106 +661,41 @@ class VIT_MADVERSARY_2(nn.Module):
 
         res = self.forward(image, mask_ratio = mask_ratio, temperature = temperature, train_recon = train_recon)
 
+        loss_masked_recon = res["loss_masked_recon"]
+        loss_mask = res["loss_mask"]
+
+
         image = image.permute(0, 2, 3, 1)
+        log_dict["mask_ratio"] = mask_ratio
+        log_dict["loss_mask"] = loss_mask.item()
+        log_dict["loss_masked_recon"] = loss_masked_recon
+        for i in range(len(res["loss_recons"])):
+            log_dict[f"loss_recon_{i}"] = res["loss_recons"][i]
+            log_dict[f"loss_mask_{i}"] = res["loss_masks"][i]
 
         log_dict["train_mask"] = not train_recon
+        log_dict["temperature"] = temperature
 
 
-        if not train_recon: # train masker
-            log_dict["mask_ratio"] = mask_ratio
-            log_dict["loss_mask"] = res["loss_mask"].item()
-            log_dict["loss_recon"] = res["loss_recon"].item()
-            for i in range(len(res["loss_whole_recons"])):
-                log_dict[f"loss_whole_recon_{i}"] = res["loss_whole_recons"][i]
-                log_dict[f"loss_patch_recon_{i}"] = res["loss_patch_recons"][i]
-                log_dict[f"loss_mask_{i}"] = res["loss_masks"][i]
+        if visualize:
+            log_dict["images"] = self.visualize(image, res)
 
+        if train_recon:
+            loss = loss_masked_recon
+            self.optimizer_recon.zero_grad()
+            loss.backward()
+            self.optimizer_recon.step()
 
-            log_dict["temperature"] = temperature
-            loss = -res["loss_recon"]+res["loss_mask"]
-
-            if visualize:
-                log_dict["images"] = self.visualize(image, res)
-
-
+        else:
+            loss = -loss_masked_recon + loss_mask
             self.optimizer_masker.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.masker.params, 1e-4)
             self.optimizer_masker.step()
 
-        else: # train reconstructor
-            log_dict["mask_ratio"] = mask_ratio
-            log_dict["loss_recon"] = res["loss_recon"].item()
-            loss = res["loss_recon"]
-
-            self.optimizer_recon.zero_grad()
-            loss.backward()
-            self.optimizer_recon.step()
-
-            if visualize:
-                log_dict["images"] = self.visualize_recon(image, res)
-
-
         log_dict["loss"] = loss.item()
 
         return log_dict
-
-
-    def get_masks_from_gt_segmentation(self, gt_segmentation, patch_size=3):
-        """
-        Returns patched masks from gt segmentation
-        Args:
-            gt_segmentation: B, slots, H, W
-
-        Returns:
-
-        """
-        B, slots, H, W = gt_segmentation.shape
-        assert H % patch_size == 0 and W % patch_size == 0
-        masks = []
-        for i in range(slots):
-            mask = gt_segmentation[:, [i], :, :]
-            mask = F.max_pool2d(mask, kernel_size=patch_size, stride=patch_size)
-            masks.append(mask)
-        masks = torch.stack(masks, dim=1).squeeze().reshape(B, slots, -1).permute(0, 2, 1)
-        return masks
-
-
-    def eval_step(self, sample, log_dict):
-        self.eval()
-
-        image = sample['image'].permute(0, 3, 1, 2).to(self.device) / 255.  # B, C, W, H
-        gt_mask = sample['mask'].squeeze().to(self.device) / 255.  # B, Slot, W, H
-        gt_patches = self.get_masks_from_gt_segmentation(gt_mask, patch_size=self.cfg.patch_size)
-        gt_mask_ratio = (gt_patches[:, :, 1:].sum(dim=1) / gt_patches.shape[1]).mean().item()
-
-        mask_ratio = self.cfg.object_size # one object
-
-
-        res = self.forward_masker(image, mask_ratio=mask_ratio, temperature=0)
-
-        # mask ratio
-        log_dict["eval.mask_ratio"] = mask_ratio
-        log_dict["eval.gt_mask_ratio"] = gt_mask_ratio
-
-        # losses
-        log_dict["eval.loss_mask"] = res["loss_mask"].item()
-        log_dict["eval.loss_recon"] = res["loss_recon"].item()
-        for i in range(len(res["loss_whole_recons"])):
-            log_dict[f"eval.loss_whole_recon_{i}"] = res["loss_whole_recons"][i]
-            log_dict[f"eval.loss_patch_recon_{i}"] = res["loss_patch_recons"][i]
-            log_dict[f"eval.loss_mask_{i}"] = res["loss_masks"][i]
-
-        loss = -res["loss_recon"]+res["loss_mask"]
-        log_dict["eval.loss"] = loss.item()
-
-        # visualize
-        log_dict["eval.images"] = self.visualize(image.permute(0, 2, 3, 1), res)
-
-
-        return log_dict
-
-
 
 
     def visualize(self, image, res_dict, max_rows=6):
@@ -853,92 +805,6 @@ class VIT_MADVERSARY_2(nn.Module):
             #    ax[batch_id, i + 2].imshow(picture[batch_id, i])
             #    ax[batch_id, i + 2].grid(False)
             #    ax[batch_id, i + 2].axis('off')
-        plt.tight_layout()
-        plt.close()
-        return fig
-
-
-    def visualize_recon(self, image, res_dict, max_rows=6):
-        """Visualizes the training progress."""
-        """
-        Args:
-        image: Tensor of shape [B, H, W, C] containing the input image.
-        recons: Tensor of shape [B, H, W, C] containing the reconstructed image.
-        attentions: List of Tensors of shape [B, H, W, H, W] containing the
-        mask: Tensor of shape [B, H, W, C] containing the mask.
-        max_rows: Maximum number of rows in the visualization."""
-        """input, reconstruction, attention_layer {}"""
-
-        batch_size = min(image.shape[0], max_rows)
-        image = image[:batch_size]
-
-        masks_learned = res_dict["mask"][:batch_size]
-
-        titles = ["image"]
-        titles.append(f"mask logits")
-        titles.append(f"masked")
-        titles.append(f"recon")
-
-        fig, ax = plt.subplots(batch_size, len(titles), figsize=(20, 9))
-
-        patch_size = self.cfg.patch_size
-        img_size = image.shape[1]
-        patches_num = img_size//patch_size
-
-        image = normalize(image.cpu().detach().numpy())  # B, H, W, C
-
-        mask_logits = normalize(res_dict["mask"].cpu().detach().numpy())  # B, H, W, C
-
-        #masked_input_learned = (1-mask_learned) * image
-
-        # reconstruct image from logits
-        recon = reconstruct_image_from_logits(res_dict["image_logits"][:batch_size, :, :],
-                                              patch_size=self.cfg.patch_size,
-                                              img_size=self.cfg.image_size,
-                                              device=self.device)  # B, H, W, C
-        recon = normalize(recon.cpu().detach().numpy())
-
-
-        for i, title in enumerate(titles):
-            ax[0, i].set_title(title)
-
-        for batch_id in range(batch_size):
-            ax[batch_id, 0].imshow(image[batch_id])
-            ax[batch_id, 0].grid(False)
-            ax[batch_id, 0].axis('off')
-
-
-            # mask logits
-            ax[batch_id, 1].imshow(mask_logits[batch_id, :].reshape(patches_num, patches_num), vmin=0, vmax=1)
-            ax[batch_id, 1].grid(False)
-            ax[batch_id, 1].axis('off')
-
-            RGB_CHANNELS = 3
-            mask_learned = F.interpolate(
-                masks_learned[:,:].detach().cpu().expand(RGB_CHANNELS, -1, -1).reshape(-1, batch_size, patches_num,
-                                                                      patches_num).permute(1, 0, 2, 3),
-                (img_size, img_size)).permute(0, 2, 3, 1)  # B, H, W, C
-
-            masked_input_learned = (1 - mask_learned) * image
-
-
-            # masked
-            ax[batch_id, 2].imshow(masked_input_learned[batch_id] + mask_learned[batch_id])
-            ax[batch_id, 2].grid(False)
-            ax[batch_id, 2].axis('off')
-
-            # recon
-
-
-
-
-            ax[batch_id, 3].imshow(recon[batch_id])
-            ax[batch_id, 3].grid(False)
-            ax[batch_id, 3].axis('off')
-
-
-
-
         plt.tight_layout()
         plt.close()
         return fig

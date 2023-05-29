@@ -13,7 +13,7 @@ from PIL import Image as Image, ImageEnhance
 from functools import partial
 from timm.layers import PatchEmbed, Mlp, DropPath, trunc_normal_, lecun_normal_, resample_patch_embed, resample_abs_pos_embed, RmsNorm
 
-from architectures.vit.vit_mae import ViTMAEModel, ViTMAEDecoderOutput, get_2d_sincos_pos_embed, ViTMAEConfig, ViTMAEDecoder,ViTMAELayer, ViTMAEForPreTraining, ViTMAEEmbeddings, ViTMAEEncoder, ViTMAEPreTrainedModel
+from architectures.vit.vit_mae import ViTMAEModel, ViTMAEDecoderOutput, get_2d_sincos_pos_embed, ViTMAEConfig, ViTMAEDecoder,ViTMAELayer, ViTMAEForPreTraining, ViTMAEEncoder, ViTMAEPreTrainedModel
 from transformers import AutoImageProcessor
 import math
 from copy import deepcopy

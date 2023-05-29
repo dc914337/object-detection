@@ -36,11 +36,19 @@ class TetrominoesDataset(data.Dataset):
     def __getitem__(self, index):
         # get data
         x = self.dataset["imgs"][index]
+        y = self.dataset["masks"][index].squeeze()
+
         if self.transform:
             x = self.transform(x.permute(2,0,1)).permute(1,2,0)
 
+            y_padded = torch.zeros((4,36,36))
+            y_padded[:,1:,1:] = y
+            y_padded[0,0,:] = 255.
+            y_padded[0,:,0] = 255.
+            y=y_padded
+
         # get label
-        y = self.dataset["masks"][index]
+
         return {"image": x, "mask": y}
 
     def __len__(self):

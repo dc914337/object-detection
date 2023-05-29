@@ -1,0 +1,63 @@
+
+resolution: &resolution 36
+patch_size: &patch_size 3
+num_classes: &num_classes 4
+
+VIT_MADVERSARY_slotattention:
+  image_size: *resolution
+  patch_size: *patch_size
+  num_classes: *num_classes
+
+  # masker
+  masker:
+    image_size: *resolution
+    patch_size: *patch_size
+
+    hidden_size: 128
+
+    # custom parameter
+    decoder_num_classes: 2
+
+    pretrained_path: null
+    #pretrained_path: "./checkpoints/whole tiny recon/recon_madversary_2_38000.pt"
+
+  # reconstructor
+  reconstructor:
+    image_size: *resolution
+    patch_size: *patch_size
+
+    num_hidden_layers: 3
+    num_attention_heads: 4
+    hidden_size: 128
+
+    intermediate_size: 260
+
+    decoder_intermediate_size: 130
+    decoder_num_hidden_layers: 3
+    decoder_num_attention_heads: 4
+    decoder_hidden_size: 128
+
+    #pretrained_path: null
+    #pretrained_path: "./checkpoints/tiny recon/recon_madversary_2_10000.pt"
+    #pretrained_path: "./checkpoints/tiny recon/recon_madversary_2_25000.pt"
+    #pretrained_path: "./checkpoints/tiny recon/recon_madversary_2_35000.pt"
+    pretrained_path: "./checkpoints/whole tiny recon/recon_madversary_2_38000.pt"
+
+
+  object_size: 0.5 #0.5 #0.18
+  temperature: 0.05
+  lr: 1.e-3
+  warmup_steps: 200
+  decay_rate: 0.5
+  decay_steps: 50000
+  norm_pix_loss: False
+
+# training
+visualize_freq: 300
+eval_freq: 2500
+dataset_path: "data/EMORL/tetrominoes.h5"
+batch_size: 8
+DEBUG: False
+
+notes: "Training small masker with small reconstructor"
+train_recon: False
