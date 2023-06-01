@@ -836,30 +836,32 @@ class VIT_MADVERSARY_2(nn.Module):
 
         image = sample['image'].permute(0, 3, 1, 2).to(self.device) / 255.  # B, C, W, H
 
-        #if train_recon:
-        ## train reconstructor
-        # todo: freeze masker
-        # mask = self.reconstructor.generate_random_mask(image.shape[0], 0.3)
-        mask, mask_logits = self.masker(image, temperature=0)
-        mask = mask.detach()[:, :, 1]  # todo: not only the first layer
-        loss, recon_log_dict = self.reconstructor.train_step(image, mask=mask, visualize=visualize)
-        self.optimizer_reconstructor.zero_grad()
-        loss.backward()
-        self.optimizer_reconstructor.step()
-        log_dict.update({f"recon.{key}": value for key, value in recon_log_dict.items()})
-        #else:
-        ## train masker
-        # todo: freeze recon
-        loss, masker_log_dict = self.masker.train_step(image, reconstructor=self.reconstructor, mask_ratio=self.cfg.object_size, temperature=temperature, visualize=visualize)
-        self.optimizer_masker.zero_grad()
-        loss.backward()
-        # torch.nn.utils.clip_grad_norm_(self.masker.params, 1e-4)
-        self.optimizer_masker.step()
-        log_dict.update({f"masker.{key}": value for key, value in masker_log_dict.items()})
+        if train_recon:
+            ## train reconstructor
+            # todo: freeze masker
+            # mask = self.reconstructor.generate_random_mask(image.shape[0], 0.3)
+            mask, mask_logits = self.masker(image, temperature=0)
 
+            # n is a list  number from 1 to 3 for each element in the first dimension
+            indices = torch.arange(mask.shape[0]).to(mask.device)
+            n = torch.randint(1, mask.shape[2], (mask.shape[0],)).to(mask.device)
 
+            mask = mask.detach()[indices, :, n]
 
-
+            loss, recon_log_dict = self.reconstructor.train_step(image, mask=mask, visualize=visualize)
+            self.optimizer_reconstructor.zero_grad()
+            loss.backward()
+            self.optimizer_reconstructor.step()
+            log_dict.update({f"recon.{key}": value for key, value in recon_log_dict.items()})
+        else:
+            ## train masker
+            # todo: freeze recon
+            loss, masker_log_dict = self.masker.train_step(image, reconstructor=self.reconstructor, mask_ratio=self.cfg.object_size, temperature=temperature, visualize=visualize)
+            self.optimizer_masker.zero_grad()
+            loss.backward()
+            # torch.nn.utils.clip_grad_norm_(self.masker.params, 1e-4)
+            self.optimizer_masker.step()
+            log_dict.update({f"masker.{key}": value for key, value in masker_log_dict.items()})
 
 
         return log_dict
