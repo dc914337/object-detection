@@ -77,9 +77,10 @@ def main():
     test_loader = torch.utils.data.DataLoader(
         TetrominoesDataset(cfg.test_dataset_path, recursive = False, load_data = True, transform=Pad((1, 1, 0, 0), fill=0)),
         batch_size=cfg.batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=7,
-        pin_memory=False)
+        pin_memory=False,
+        drop_last=True)
 
     wandb.watch(model)
 
@@ -96,7 +97,7 @@ def main():
 
                 visualize = (iteration % cfg.visualize_freq == 0) or (iteration in [3, 50, 100, 300, 500])
 
-                if iteration % 200 == 0:
+                if iteration % cfg.switch_training_recon_masker_steps == 0:
                     train_recon = not train_recon
 
                 log_dict = {}
@@ -107,7 +108,7 @@ def main():
                 log_dict["epoch"] = epoch
                 wandb.log(log_dict, step=iteration)
 
-                pbar.set_postfix(loss=log_dict["loss"])
+                #pbar.set_postfix(loss=log_dict["loss"])
                 pbar.update()
 
 
@@ -124,15 +125,19 @@ def main():
                 # eval model
                 eval_dicts = []
                 for batch in test_loader:
-                    log_dict = {}
-                    model.eval_step(batch, log_dict)
-                    eval_dicts.append(log_dict)
+                    eval_dict = model.eval_step(batch)
+                    eval_dicts.append(eval_dict)
 
                 # merge dicts
                 eval_dict = {}
                 for k in eval_dicts[0].keys():
-                    if k != "eval.images":
-                        eval_dict[k] = torch.stack( [torch.tensor(d[k]) for d in eval_dicts]).mean()
+                    if k not in {"eval.images", "eval.mask", "eval.mask_real", "eval.logits_masked_img"}:
+                        #if float convert to tensor if not already and take mean
+                        if isinstance(eval_dicts[0][k], torch.Tensor):
+                            eval_dict[k] = torch.stack([d[k] for d in eval_dicts]).mean()
+                        else:
+                            eval_dict[k] = torch.stack([torch.as_tensor(float(d[k])) for d in eval_dicts]).mean()
+
 
                 eval_dict["eval.images"] = eval_dicts[0]["eval.images"]
                 eval_dict["epoch"] = epoch
