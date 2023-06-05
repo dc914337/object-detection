@@ -891,11 +891,15 @@ class VIT_MADVERSARY_2(nn.Module):
         self.eval()
 
         image = sample['image'].permute(0, 3, 1, 2).to(self.device) / 255.  # B, C, W, H
+        gt_mask = sample['mask'].squeeze().to(self.device) / 255.
+        gt_mask_prob = self.get_masks_from_gt_segmentation(gt_mask, patch_size=self.cfg.patch_size)
+
         loss, masker_log_dict = self.masker.train_step(image,
                                                        reconstructor=self.reconstructor,
                                                        temperature=0,
                                                        mask_ratio=self.cfg.object_size,
                                                        visualize=True)
+
         masker_log_dict = {f"eval.{key}": value for key, value in masker_log_dict.items()}
         return masker_log_dict
 
